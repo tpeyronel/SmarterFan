@@ -1,0 +1,68 @@
+# SmarterFan — milestone 0: RF protocol sniffer
+#
+# Read-only. Taps the fan's 433 MHz receiver output through the BSS138
+# shifter (channel 2) and dumps every packet it sees.
+#
+# Requires NO modification to the fan board. See README.md.
+
+esphome:
+  name: smarterfan-sniffer
+  friendly_name: SmarterFan Sniffer
+
+esp32:
+  board: esp32-c3-devkitm-1
+  framework:
+    type: esp-idf
+
+logger:
+  level: DEBUG
+  # C3 has native USB-Serial-JTAG; this puts logs on the USB-C port.
+  hardware_uart: USB_SERIAL_JTAG
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # Fallback AP if the network is unreachable. Not strictly needed on the
+  # bench, but keep it — it is what saves a ladder trip later.
+  ap:
+    ssid: "SmarterFan Setup"
+    password: !secret ap_password
+
+captive_portal:
+
+# Lets you set Wi-Fi over USB without recompiling.
+improv_serial:
+
+# Required for `esphome logs` to stream over Wi-Fi — which is how you read
+# captures while the board runs off a floating USB power bank.
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+remote_receiver:
+  pin:
+    number: GPIO6
+  dump: all
+
+  # --- Tuning knobs -------------------------------------------------
+  # The receiver's AGC outputs continuous noise when nothing is
+  # transmitting. Raise `filter` until the log goes quiet with no button
+  # pressed, then confirm real packets still get through.
+  filter: 200us
+
+  # Gap that marks the end of a packet. Raise if single presses are being
+  # split into multiple partial dumps.
+  idle: 10ms
+
+  # Timing match slack. Loosen if `dump: all` almost-but-not-quite
+  # recognises a protocol.
+  tolerance: 25%
+
+# --- Milestone 2: uncomment once you have captures to replay ----------
+# remote_transmitter:
+#   pin: GPIO5
+#   carrier_duty_percent: 100%   # OOK — no carrier modulation at baseband
