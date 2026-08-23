@@ -44,6 +44,23 @@ ota:
   - platform: esphome
     password: !secret ota_password
 
+sensor:
+  # Raw RSSI once per second — for watching antenna changes live.
+  - platform: wifi_signal
+    name: "WiFi signal"
+    id: wifi_rssi
+    update_interval: 1s
+
+  # RSSI bounces several dB on its own. Compare THIS between antenna
+  # configurations, not the raw value above.
+  - platform: wifi_signal
+    name: "WiFi signal median"
+    update_interval: 1s
+    filters:
+      - median:
+          window_size: 10
+          send_every: 10
+
 remote_receiver:
   pin:
     number: GPIO6
