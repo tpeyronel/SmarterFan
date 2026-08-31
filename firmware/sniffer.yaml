@@ -186,9 +186,9 @@ remote_receiver:
   # so each of the five repeats becomes its own capture.
   #
   # This was 12ms, chosen to keep a whole burst in one capture so a decoder
-  # could scan across the repeats. That is no longer needed -- `fan_rf`
-  # deduplicates on the press counter, so five repeats arriving as five
-  # captures still produce exactly one event -- and 12ms carries a real bug.
+  # could scan across the repeats. That is no longer needed -- `fan_rf` counts
+  # frames rather than captures, so five repeats arriving as five captures
+  # still produce exactly one press -- and 12ms carries a real bug.
   #
   # A held button keeps transmitting frames every 41.1ms with only 8.79ms
   # between them. Nothing ever reaches 12ms of idle, so the capture never
@@ -211,9 +211,9 @@ remote_receiver:
   # numbering -- that view needs the whole burst in one capture.
   idle: 4ms
 
-  # Timing match slack. Neither `fan_rf` nor `fan_rf_dump` reads this -- each
-  # carries its own matching window -- but any other listener on this receiver
-  # would, so it is left at the value that was established for rc_switch.
+  # Timing match slack. Neither `fan_rf` nor `fan_rf_dump` reads this -- they
+  # share one matching window, in fan_rf_dump_protocol.h -- but any other
+  # listener on this receiver would, so it is left where rc_switch had it.
   #
   # 25% was too tight and the sensors fired on 5 of 37 presses. The AGC does
   # not just settle in amplitude, it skews the duty cycle: in the first frame
@@ -257,29 +257,46 @@ remote_receiver:
 # (log4.txt): frame 1 decodes 40% of the time, frames 3-5 decode 100%.
 # That gap is exactly what the sensors' 5-of-37 hit rate was.
 #
-# `fan_rf` below splits the capture on the inter-frame gap, decodes every
-# frame independently, and majority-votes the survivors.
+# `fan_rf` below splits the capture on the inter-frame gap and decodes every
+# frame independently, so a damaged frame 1 costs nothing.
 external_components:
   - source:
       type: local
       path: components
-    components: [fan_rf_dump]
-    # components: [fan_rf, fan_rf_dump]
+    components: [fan_rf, fan_rf_dump]
 
-# fan_rf:
-#   id: fan_remote
-#   # Five repeats of one press share a codeword, so an identical code inside
-#   # this window is the same press arriving twice (a burst split across two
-#   # captures, or a held button) rather than a new one. Consecutive presses
-#   # always differ in press counter, so this cannot swallow a real press.
-#   dedup_window: 1000ms
+fan_rf:
+  id: fan_remote
 
-#   # The useful primitive: fires once per press with the command byte, the
-#   # press counter, and the raw 32-bit code. Bind actions here.
-#   on_code:
-#     - lambda: |-
-#         ESP_LOGI("remote", "press cmd=0x%02X counter=%u code=0x%08lX",
-#                  command, counter, (unsigned long) code);
+  # A press is five identical frames; a held button just keeps sending more of
+  # them, one every 41.1ms, with the press counter unchanged. So the only way to
+  # tell "pressed" from "still holding" is to count frames:
+  #
+  #   frame:  1   2   3   4   5   6   7   8  ...
+  #   event:  P   .   .   .   .   R1  R2  R3
+  #
+  # The first frame of a new codeword is the press, reported straight away.
+  # `press_frames` - 1 more frames of the same codeword are the rest of that
+  # press and are swallowed, so a tap fires exactly once. Everything past them
+  # is the button being held, and each frame is its own repeat event.
+  #
+  # Set this to 1 to report every frame the remote sends.
+  press_frames: 5
+
+  # A run of identical frames ends after this long without one. Six frame
+  # periods: long enough to ride out dropped frames mid-hold, short enough that
+  # a release is noticed promptly. It is also what separates the ninth press of
+  # one button -- the counter wraps at 8, so its codeword comes round again --
+  # from the same hold continuing.
+  run_timeout: 250ms
+
+  # The useful primitive: fires with the key, the press counter, the raw 32-bit
+  # code, and a repeat index that is 0 for the press itself and 1, 2, 3... for
+  # each frame of a hold. Bind actions here.
+  on_code:
+    - lambda: |-
+        ESP_LOGI("remote", "key=%u counter=%u code=0x%08lX repeat=%lu",
+                 key, counter, (unsigned long) code, (unsigned long) repeat);
 
 # DIAGNOSTIC — the plain view of what the receiver delivered.
 #
@@ -293,25 +310,39 @@ external_components:
 # the report that a frame was corrupt. Silent on captures that yield nothing,
 # which is most of them.
 #
-# Standalone — it needs `remote_receiver` and nothing else, and carries its own
-# copy of the frame decoder. It is listed here alongside `fan_rf` only because
-# both are wanted; neither needs the other. Costs nothing to leave on: every
-# listener sees every capture, so the two decode the same data independently.
+# Standalone — it needs `remote_receiver` and nothing else. It is also where the
+# frame decoder lives: `fan_rf` includes fan_rf_dump_protocol.h rather than
+# carrying a copy, and AUTO_LOADs this component for that header alone. That is
+# why both names appear in `external_components` above — AUTO_LOAD cannot import
+# a component that list leaves out — while the block below is what actually
+# creates a dumper. Delete the block and `fan_rf` still builds and runs. Costs
+# nothing to leave on: every listener sees every capture, so the two work from
+# the same data.
 fan_rf_dump:
   id: fan_remote_dump
 
+# Named buttons, built on the same decode. `key` takes any name from the table
+# in PROTOCOL.md section 4 — bright_up, bright_down, colour_temp_up,
+# colour_temp_down, light_toggle, all_off, cycle_full_bright, night_mode,
+# natural_wind, fan_off, fan_1..fan_6, fan_forward, fan_reverse, timer_2h,
+# timer_4h — or a raw 0-31 value.
+#
+# `repeats` defaults to true, so a held button pulses the sensor every 41.1ms,
+# which is what makes hold-to-dim work from an automation. Turn it off on a
+# button where a long press should still register only once.
 # binary_sensor:
 #   - platform: fan_rf
 #     name: "Remote: brightness up"
-#     command: brightness_up
+#     key: bright_up
 
 #   - platform: fan_rf
-#     name: "Remote: colour temp up"
-#     command: colour_temp_up
+#     name: "Remote: brightness down"
+#     key: bright_down
 
 #   - platform: fan_rf
-#     name: "Remote: fan speed 1"
-#     command: fan_speed_1
+#     name: "Remote: light on/off"
+#     key: light_toggle
+#     repeats: false
 
 # --- Milestone 2: uncomment once you have captures to replay ----------
 # remote_transmitter:

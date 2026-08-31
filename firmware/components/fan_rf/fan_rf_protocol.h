@@ -1,34 +1,30 @@
-// Novohome NH-VTR500 433 MHz OOK remote — pure protocol decoder.
+// Novohome NH-VTR500 433 MHz remote -- packet layer.
 //
-// Deliberately free of any ESPHome (or Arduino, or ESP-IDF) dependency: this
-// header is compiled unchanged both into the firmware and into the host
-// self-test in tools/fan_rf_selftest.cpp, so the logic that runs on the device
-// is literally the logic validated against the captured logs. Anything that
-// needs the framework lives in fan_rf.h.
+// The frame layer lives in the sibling fan_rf_dump component and is included
+// below rather than copied: symbol timings, decode_frame() and walk_frames()
+// have exactly one definition in this repo. This header adds what fan_rf_dump
+// deliberately does not do -- split a 32-bit word into fields, validate it, name
+// the button, and turn a stream of frames into press and repeat events.
 //
-// Wire format
-// -----------
-//   [~350us mark][7.69ms gap]                         preamble, once
-//   then 5x [32 data bits][~330us stop mark][8.79ms gap]
+// The wire and frame formats are documented in PROTOCOL.md. In brief:
 //
-//   bit 0 = 288us mark + 704us space      bit period ~1009us
-//   bit 1 = 800us mark + 224us space
+//   31                                  11        6      3   0
+//   +----------------------+-----------+---------+------------+
+//   |        prefix        |    KEY    |   CNT   |     CS     |
+//   |    20b, 0xA1D82      |    5b     |   3b    |     4b     |
+//   +----------------------+-----------+---------+------------+
 //
-// Packet, 32 bits MSB first:
+//   CS = (word >> 8 & 0xF) ^ (word >> 4 & 0xF) ^ 0x6
 //
-//   [ 0..15] 0xA1D8   remote / device ID
-//   [16..23] command  0x21 brightness+, 0x23 colour temp+, 0x28 fan speed 1
-//   [24..27] high nibble = [domain flag][3-bit press counter]
-//   [28..31] low nibble  = high nibble XOR (command & 0x0F) XOR 6
-//
-// Why this exists at all: ESPHome's rc_switch decoder syncs once and then
-// reads bits from offset 0 of the capture. All five repeats carry the same
-// payload, but the receiver's AGC corrupts the first one while it settles, so
-// a decoder that only ever looks at the first frame fails on the one frame
-// that is damaged. This one splits the capture on the inter-frame gap, decodes
-// every frame independently, and majority-votes the survivors.
+// Free of any ESPHome, Arduino or IDF dependency, so it compiles unchanged into
+// the firmware and into tools/fan_rf_selftest.cpp. Anything that needs the
+// framework lives in fan_rf.h.
 
 #pragma once
+
+// Sibling component, same directory level in both trees: this repo's
+// firmware/components/ and ESPHome's generated src/esphome/components/.
+#include "../fan_rf_dump/fan_rf_dump_protocol.h"
 
 #include <stdint.h>
 #include <stddef.h>
@@ -36,272 +32,195 @@
 namespace smarterfan {
 namespace fan_rf {
 
-// Symbol timings in microseconds.
-//
-// The protocol is a single tick, 1:3 PWM -- the standard OOK remote encoding:
-//
-//     tick  = 252us
-//     bit 0 = 1 tick mark + 3 tick space
-//     bit 1 = 3 tick mark + 1 tick space
-//     period = 4 ticks = 1008us, measured at 1009us
-//
-// Measured pulses do NOT sit on those values: the receiver stretches marks and
-// eats spaces by the same amount (+17us / -16us on average, +89us in the first
-// frame of a burst while the AGC settles). That bias is common-mode, so it
-// cancels in mark+space and leaves the period untouched -- which is why the
-// period is checked separately below and is by far the strongest test here.
-//
-// An earlier revision used 288/800/224/704. Those were not measurements: they
-// are 9/25/7/22 x 32, the grid imposed by the deleted rc_switch profile's
-// `pulse_length: 32`. They sat further from the measured centres (23.5us
-// average error) than these do (16.5us).
-static const uint32_t SHORT_US = 252;
-static const uint32_t LONG_US = 756;
+// The frame layer, borrowed wholesale. Re-exported so callers of this header do
+// not have to know which component the decoder came from.
+namespace frame = ::smarterfan::fan_rf_dump;
+using frame::FrameWalk;
+using frame::PACKET_BITS;
+using frame::decode_frame;
+using frame::is_frame_gap;
+using frame::walk_frames;
 
-// Width slack, percent. Wide on purpose: with the period check carrying the
-// selectivity, this is a sanity rail on each pulse rather than the primary
-// discriminator. 50% is where the frame yield plateaus, and it makes the
-// filter a strict superset of the old 288/800/224/704 at 40% -- every frame
-// that decoded before still decodes, with identical bits.
-static const uint32_t WIDTH_TOLERANCE_PCT = 50;
+// Bits 31..12, constant across every frame from this remote. Transmitter
+// identity, possibly with a protocol constant folded in -- a single-remote
+// capture cannot separate the two.
+static const uint32_t PREFIX = 0xA1D82;
 
-// Bit period, and the real discriminator. Measured mean 1009.1us with a
-// standard deviation of 3.3us over 10592 symbols, so +/-5% is about 15 sigma
-// and cannot reject a real frame. On noise, where mark and space are
-// uncorrelated, the sum wanders freely and this rejects most pairs outright:
-// measured against the noise captures it accepts 2.2% of pairs where the width
-// windows alone accept 7.3%.
-static const uint32_t PERIOD_US = 1009;
-static const uint32_t PERIOD_TOLERANCE_PCT = 5;
+// The three payload nibbles XOR to this. See PROTOCOL.md section 2.
+static const uint8_t CHECK_XOR = 0x6;
 
-// A space longer than this ends a frame. The real inter-frame gap is
-// 8787us +/- 10us and the preamble gap is 7.69ms; the longest in-frame space
-// is a ~700us zero, so 5ms sits far from anything.
-static const uint32_t FRAME_GAP_US = 5000;
+// KEY is a lookup table, not an encoding: the values are not contiguous and
+// nothing about a code predicts its button. Do not extrapolate this.
+// 0, 1, 2, 14, 20, 23, 24, 26, 27 and 29..31 are unused by this remote.
+static const uint8_t KEY_BRIGHT_UP = 3;
+static const uint8_t KEY_FAN_FORWARD = 4;
+static const uint8_t KEY_BRIGHT_DOWN = 5;
+static const uint8_t KEY_ALL_OFF = 6;
+static const uint8_t KEY_TEMP_UP = 7;
+static const uint8_t KEY_LIGHT_TOGGLE = 8;
+static const uint8_t KEY_TIMER_2H = 9;
+static const uint8_t KEY_FAN_4 = 10;
+static const uint8_t KEY_TEMP_DOWN = 11;
+static const uint8_t KEY_FAN_6 = 12;
+static const uint8_t KEY_CYCLE_FULL_BRIGHT = 13;
+static const uint8_t KEY_FAN_5 = 15;
+static const uint8_t KEY_FAN_1 = 16;
+static const uint8_t KEY_FAN_REVERSE = 17;
+static const uint8_t KEY_FAN_2 = 18;
+static const uint8_t KEY_NIGHT_MODE = 19;
+static const uint8_t KEY_NATURAL_WIND = 21;
+static const uint8_t KEY_FAN_OFF = 22;
+static const uint8_t KEY_TIMER_4H = 25;
+static const uint8_t KEY_FAN_3 = 28;
 
-static const uint32_t PACKET_BITS = 32;
-static const uint16_t DEVICE_ID = 0xA1D8;
-static const uint8_t CHECK_XOR = 6;
-
-// Frames per burst. Only used to size the vote table; a capture carrying more
-// (two presses merged, say) simply votes over the first MAX_FRAMES it decodes.
-static const uint8_t MAX_FRAMES = 12;
+inline const char *key_name(uint8_t key) {
+  switch (key) {
+    case KEY_BRIGHT_UP: return "bright+";
+    case KEY_FAN_FORWARD: return "fan forward";
+    case KEY_BRIGHT_DOWN: return "bright-";
+    case KEY_ALL_OFF: return "all off";
+    case KEY_TEMP_UP: return "temp+";
+    case KEY_LIGHT_TOGGLE: return "light on/off";
+    case KEY_TIMER_2H: return "2H";
+    case KEY_FAN_4: return "fan 4";
+    case KEY_TEMP_DOWN: return "temp-";
+    case KEY_FAN_6: return "fan 6";
+    case KEY_CYCLE_FULL_BRIGHT: return "cycle full bright";
+    case KEY_FAN_5: return "fan 5";
+    case KEY_FAN_1: return "fan 1";
+    case KEY_FAN_REVERSE: return "fan reverse";
+    case KEY_FAN_2: return "fan 2";
+    case KEY_NIGHT_MODE: return "night mode";
+    case KEY_NATURAL_WIND: return "natural wind";
+    case KEY_FAN_OFF: return "fan off";
+    case KEY_TIMER_4H: return "4H";
+    case KEY_FAN_3: return "fan 3";
+    default: return "unknown";
+  }
+}
 
 struct Packet {
-  uint32_t raw;       // the 32 bits as received, MSB first
-  uint16_t device;    // bits 0..15
-  uint8_t command;    // bits 16..23
-  uint8_t domain;     // bit 24: 1 = light, 0 = fan
-  uint8_t counter;    // bits 25..27, +1 mod 8 per press of any button
-  uint8_t check;      // bits 28..31
+  uint32_t raw;      // the 32 bits as received, MSB first
+  uint32_t prefix;   // bits 31..12
+  uint8_t key;       // bits 11..7 -- which button
+  uint8_t counter;   // bits 6..4  -- +1 mod 8 per press of any button
+  uint8_t check;     // bits 3..0
 
-  bool device_ok;
+  bool prefix_ok;
   bool check_ok;
-  // Advisory only. The domain flag is the inverse of command bit 3 for every
-  // command captured so far, but only three of the remote's buttons have been
-  // seen, so a mismatch is reported rather than treated as a bad packet.
-  bool domain_ok;
 
-  // The ID and the check nibble are what validate a packet. An unrecognised
-  // command byte is valid-but-unnamed, not an error.
-  bool valid() const { return this->device_ok && this->check_ok; }
+  // An unlisted KEY is valid-but-unnamed, never an error: the prefix and the
+  // checksum are what say a packet is real. Twelve KEY values are unused by
+  // this remote, but a second remote or an unpressed button could use them.
+  bool valid() const { return this->prefix_ok && this->check_ok; }
 };
-
-struct DecodeResult {
-  bool ok;                 // a valid packet won the vote
-  Packet packet;
-  uint16_t frames_total;   // chunks between gaps, preamble included
-  uint16_t frames_decoded; // chunks that yielded 32 clean bits
-  uint16_t votes;          // frames agreeing with the winner
-};
-
-// Percentage-tolerance match, same convention as remote_base.
-inline bool timing_matches(int32_t value, uint32_t nominal) {
-  if (value < 0)
-    value = -value;
-  const uint32_t v = (uint32_t) value;
-  return v >= (100 - WIDTH_TOLERANCE_PCT) * nominal / 100 &&
-         v <= (100 + WIDTH_TOLERANCE_PCT) * nominal / 100;
-}
-
-// mark + space, the quantity the receiver's duty-cycle skew cancels out of.
-inline bool period_matches(int32_t mark, int32_t space) {
-  const uint32_t total = (uint32_t) (mark - space);  // space is negative
-  return total >= (100 - PERIOD_TOLERANCE_PCT) * PERIOD_US / 100 &&
-         total <= (100 + PERIOD_TOLERANCE_PCT) * PERIOD_US / 100;
-}
-
-inline bool is_frame_gap(int32_t value) { return value < -(int32_t) FRAME_GAP_US; }
-
-// Decode one frame: 32 (mark, space) pairs, MSB first, optionally followed by
-// a lone stop mark. Returns false unless every one of the 32 symbols matches,
-// which is what makes a corrupt frame drop out instead of voting garbage.
-inline bool decode_frame(const int32_t *frame, size_t len, uint32_t *out) {
-  if (len < PACKET_BITS * 2)
-    return false;
-  uint32_t bits = 0;
-  for (size_t i = 0; i < PACKET_BITS * 2; i += 2) {
-    const int32_t mark = frame[i];
-    const int32_t space = frame[i + 1];
-    if (mark <= 0 || space >= 0)
-      return false;  // marks are positive, spaces negative -- never both
-    if (!period_matches(mark, space))
-      return false;
-    if (timing_matches(mark, LONG_US) && timing_matches(space, SHORT_US)) {
-      bits = (bits << 1) | 1;
-    } else if (timing_matches(mark, SHORT_US) && timing_matches(space, LONG_US)) {
-      bits = bits << 1;
-    } else {
-      return false;
-    }
-  }
-  *out = bits;
-  return true;
-}
 
 // Split a 32-bit codeword into fields and verify them.
 inline Packet decode_packet(uint32_t bits) {
   Packet p;
   p.raw = bits;
-  p.device = (uint16_t) (bits >> 16);
-  p.command = (uint8_t) (bits >> 8);
-  const uint8_t high = (uint8_t) ((bits >> 4) & 0x0F);
-  const uint8_t low = (uint8_t) (bits & 0x0F);
-  p.domain = high >> 3;
-  p.counter = high & 0x07;
-  p.check = low;
-  p.device_ok = p.device == DEVICE_ID;
-  p.check_ok = low == (uint8_t) (high ^ (p.command & 0x0F) ^ CHECK_XOR);
-  p.domain_ok = p.domain == ((p.command & 0x08) ? 0 : 1);
+  p.prefix = bits >> 12;
+  p.key = (uint8_t) ((bits >> 7) & 0x1F);
+  p.counter = (uint8_t) ((bits >> 4) & 0x07);
+  p.check = (uint8_t) (bits & 0x0F);
+
+  p.prefix_ok = p.prefix == PREFIX;
+
+  // The three payload nibbles XOR to CHECK_XOR. Equivalent to recomputing CS
+  // from KEY and CNT, but symmetric and one expression.
+  const uint8_t n5 = (uint8_t) ((bits >> 8) & 0x0F);
+  const uint8_t n6 = (uint8_t) ((bits >> 4) & 0x0F);
+  const uint8_t n7 = (uint8_t) (bits & 0x0F);
+  p.check_ok = (uint8_t) (n5 ^ n6 ^ n7) == CHECK_XOR;
+
   return p;
 }
 
-struct FrameWalk {
-  uint16_t chunks;   // chunks between gaps, preamble included
-  uint16_t decoded;  // chunks that yielded 32 clean bits
+// Build the codeword for a button at a given press counter. The inverse of
+// decode_packet, for the transmit path and for tests.
+inline uint32_t encode_packet(uint8_t key, uint8_t counter) {
+  const uint8_t k = key & 0x1F;
+  const uint8_t c = counter & 0x07;
+  const uint8_t n5 = (uint8_t) (k >> 1);
+  const uint8_t n6 = (uint8_t) (((k & 1) << 3) | c);
+  const uint8_t n7 = (uint8_t) (n5 ^ n6 ^ CHECK_XOR);
+  return (PREFIX << 12) | ((uint32_t) k << 7) | ((uint32_t) c << 4) | n7;
+}
+
+// --- press / repeat tracking ------------------------------------------------
+//
+// The remote gives no explicit repeat code: a held button just keeps sending
+// the same frame, counter unchanged, at one frame every 41.1 ms. So the only
+// way to tell "pressed" from "still holding" is to count frames.
+//
+//   frame:  1   2   3   4   5   6   7   8   ...
+//   event:  P   .   .   .   .   R1  R2  R3
+//
+// The first frame of a new codeword is the press, reported immediately -- about
+// 37 ms after the remote started transmitting, rather than 218 ms if it waited
+// for the burst to finish. The next PRESS_FRAMES-1 frames are the rest of that
+// same press and are swallowed, so a plain tap fires exactly once. Anything
+// beyond that is the button being held, and each such frame is its own repeat.
+//
+// A run ends when the codeword changes or when RUN_TIMEOUT_MS passes with no
+// frame. The timeout is what stops the ninth press of one button -- the counter
+// wraps at 8, so its codeword repeats -- from looking like a continuing hold.
+// It has to sit above the 41.1 ms frame period with room for dropped frames,
+// and below the interval between two deliberate presses.
+//
+// Frames that fail validation never reach here, so noise cannot extend a run.
+//
+// Time is passed in rather than read, so this is testable and carries no
+// dependency on the framework.
+
+static const uint8_t DEFAULT_PRESS_FRAMES = 5;
+static const uint32_t DEFAULT_RUN_TIMEOUT_MS = 250;
+
+struct PressEvent {
+  bool emit;        // false = swallowed as part of the press already reported
+  uint32_t repeat;  // 0 = the press itself, 1.. = index of a held repeat
 };
 
-// Split a capture on inter-frame gaps and decode every chunk independently,
-// calling on_frame(position, bits) for each one that comes out clean.
-//
-// Every chunk is tried, including the first: the preamble is a lone mark and
-// fails the length check on its own, so there is no need to assume the capture
-// begins at a burst boundary. That matters -- captures do start mid-burst.
-//
-// `position` is 1-based and skips a leading preamble chunk, so "frame 1" means
-// the first data frame and a gap in the numbering is a frame that did not
-// decode. A frame is all-or-nothing: one symbol that matches neither bit
-// rejects the whole thing, which is what keeps a corrupt frame out of the
-// caller's hands entirely rather than handing it over half-decoded.
-template<typename F> inline FrameWalk walk_frames(const int32_t *data, size_t len, F &&on_frame) {
-  FrameWalk walk = {0, 0};
-  uint16_t first_data = 0;
-  bool first_seen = false;
-  size_t start = 0;
-
-  for (size_t i = 0; i <= len; i++) {
-    const bool boundary = (i == len) || is_frame_gap(data[i]);
-    if (!boundary)
-      continue;
-
-    const size_t chunk_len = i - start;
-    if (!first_seen) {
-      first_seen = true;
-      if (chunk_len < PACKET_BITS * 2)
-        first_data = 1;  // a lone preamble mark; do not number it as a frame
-    }
-
-    uint32_t bits;
-    if (decode_frame(&data[start], chunk_len, &bits)) {
-      walk.decoded++;
-      on_frame((uint16_t) (walk.chunks >= first_data ? walk.chunks - first_data + 1 : 1), bits);
-    }
-    walk.chunks++;
-    start = i + 1;
-  }
-  return walk;
-}
-
-// Decode every frame in a capture and majority-vote the ones that decoded.
-inline DecodeResult decode_capture(const int32_t *data, size_t len) {
-  DecodeResult result;
-  result.ok = false;
-  result.votes = 0;
-
-  uint32_t codes[MAX_FRAMES];
-  uint16_t counts[MAX_FRAMES];
-  uint8_t distinct = 0;
-
-  const FrameWalk walk = walk_frames(data, len, [&](uint16_t, uint32_t bits) {
-    uint8_t slot = 0;
-    while (slot < distinct && codes[slot] != bits)
-      slot++;
-    if (slot == distinct && distinct < MAX_FRAMES) {
-      codes[distinct] = bits;
-      counts[distinct] = 0;
-      distinct++;
-    }
-    if (slot < distinct)
-      counts[slot]++;
-  });
-  result.frames_total = walk.chunks;
-  result.frames_decoded = walk.decoded;
-
-  if (distinct == 0)
-    return result;
-
-  // Most votes wins. A tie goes to whichever candidate validates -- frames are
-  // visited in order, so without that rule a 1-1 tie would hand the burst to
-  // frame 1, the one the AGC is known to damage.
-  uint8_t best = 0;
-  bool best_valid = decode_packet(codes[0]).valid();
-  for (uint8_t i = 1; i < distinct; i++) {
-    const bool valid = decode_packet(codes[i]).valid();
-    if (counts[i] > counts[best] || (counts[i] == counts[best] && valid && !best_valid)) {
-      best = i;
-      best_valid = valid;
-    }
-  }
-  result.votes = counts[best];
-  result.packet = decode_packet(codes[best]);
-  result.ok = result.packet.valid();
-  return result;
-}
-
-// Collapses the repeats of one press into a single event.
-//
-// One press is five identical frames inside one capture, so the vote already
-// handles the normal case. This covers the rest: a burst that arrives as two
-// captures (the RMT buffer filling and re-arming mid-burst does exactly that),
-// and a held button repeating the same codeword.
-//
-// The press counter is what actually separates presses -- it advances +1 mod 8
-// on every press of any button -- so an identical *codeword* inside the window
-// is by definition the same press. Aliasing would need eight presses to land
-// inside one window, which no sane window is long enough for.
-//
-// Time is passed in rather than read, so this is testable against a log's
-// timestamps and carries no dependency on the framework.
-class PressFilter {
+class PressTracker {
  public:
-  void set_window_ms(uint32_t ms) { this->window_ms_ = ms; }
-  uint32_t get_window_ms() const { return this->window_ms_; }
+  void set_press_frames(uint8_t frames) { this->press_frames_ = frames < 1 ? 1 : frames; }
+  uint8_t get_press_frames() const { return this->press_frames_; }
+  void set_run_timeout_ms(uint32_t ms) { this->run_timeout_ms_ = ms; }
+  uint32_t get_run_timeout_ms() const { return this->run_timeout_ms_; }
 
-  bool accept(uint32_t code, uint32_t now_ms) {
-    const bool repeat = this->primed_ && code == this->last_code_ &&
-                        (uint32_t) (now_ms - this->last_time_) < this->window_ms_;
-    // Refresh the timestamp either way, so holding a button down stays
-    // suppressed instead of leaking one event per window.
-    this->last_code_ = code;
-    this->last_time_ = now_ms;
-    this->primed_ = true;
-    return !repeat;
+  PressEvent feed(uint32_t code, uint32_t now_ms) {
+    const bool continuing = this->primed_ && code == this->code_ &&
+                            (uint32_t) (now_ms - this->last_ms_) < this->run_timeout_ms_;
+    this->last_ms_ = now_ms;
+
+    if (!continuing) {
+      this->primed_ = true;
+      this->code_ = code;
+      this->frames_ = 1;
+      return PressEvent{true, 0};
+    }
+
+    if (this->frames_ < 0xFFFF)
+      this->frames_++;
+    if (this->frames_ <= this->press_frames_)
+      return PressEvent{false, 0};
+    return PressEvent{true, (uint32_t) (this->frames_ - this->press_frames_)};
+  }
+
+  // Frames counted into the run so far, held codeword included. Diagnostic.
+  uint16_t frames_in_run() const { return this->frames_; }
+
+  void reset() {
+    this->primed_ = false;
+    this->frames_ = 0;
   }
 
  private:
-  uint32_t window_ms_{1000};
-  uint32_t last_code_{0};
-  uint32_t last_time_{0};
+  uint32_t code_{0};
+  uint32_t last_ms_{0};
+  uint16_t frames_{0};
+  uint32_t run_timeout_ms_{DEFAULT_RUN_TIMEOUT_MS};
+  uint8_t press_frames_{DEFAULT_PRESS_FRAMES};
   bool primed_{false};
 };
 

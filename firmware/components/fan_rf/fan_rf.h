@@ -1,23 +1,22 @@
 // ESPHome binding for the Novohome NH-VTR500 remote decoder.
 //
-// Registers as a listener on `remote_receiver` and hands each raw capture to
-// the framework-free decoder in fan_rf_protocol.h, which is where the protocol
-// actually lives. This file is only plumbing: dedupe, trigger dispatch, and
-// per-command binary sensors.
+// Registers as a listener on `remote_receiver`, hands each raw capture to the
+// frame decoder shared with fan_rf_dump, and turns the resulting stream of
+// frames into press and repeat events through the framework-free packet layer
+// in fan_rf_protocol.h. This file is only plumbing: dispatch to the trigger and
+// to the per-key binary sensors.
 //
-// This replaces the three `rc_switch_raw` binary sensors that used to be in
-// sniffer.yaml. Those could not work: RCSwitchBase::decode() syncs once and
-// reads bits from offset 0, so it only ever sees frame 1 of the five repeats --
-// the one the receiver's AGC corrupts while it settles. Measured on a cold
-// press, frame 1 decodes 40% of the time and frames 3-5 decode 100% of the
-// time. Scanning past the damaged frame is the entire point of this component.
+// Frames are processed one at a time, in the order they arrive, and the press
+// tracker is fed per frame rather than per capture. That makes the component
+// independent of `remote_receiver`'s `idle` setting: at 4 ms each of a burst's
+// five repeats is its own capture, at 12 ms all five sit in one, and either way
+// a tap produces one event and a hold produces one event plus a repeat per
+// extra frame.
 
 #pragma once
 
-#include "esphome/core/automation.h"
 #include "esphome/core/component.h"
 #include "esphome/core/hal.h"
-#include "esphome/core/helpers.h"
 #include "esphome/core/log.h"
 #include "esphome/components/binary_sensor/binary_sensor.h"
 #include "esphome/components/remote_base/remote_base.h"
@@ -33,9 +32,10 @@ class FanRfBinarySensor;
 
 class FanRfDecoder : public esphome::Component, public esphome::remote_base::RemoteReceiverListener {
  public:
-  void set_dedup_window(uint32_t ms) { this->filter_.set_window_ms(ms); }
+  void set_press_frames(uint8_t frames) { this->tracker_.set_press_frames(frames); }
+  void set_run_timeout(uint32_t ms) { this->tracker_.set_run_timeout_ms(ms); }
   void register_binary_sensor(FanRfBinarySensor *sensor) { this->sensors_.push_back(sensor); }
-  void add_on_code_callback(std::function<void(uint8_t, uint8_t, uint32_t)> &&callback) {
+  void add_on_code_callback(std::function<void(uint8_t, uint8_t, uint32_t, uint32_t)> &&callback) {
     this->callbacks_.add(std::move(callback));
   }
 
@@ -44,35 +44,39 @@ class FanRfDecoder : public esphome::Component, public esphome::remote_base::Rem
 
   // Exposed so a `remote_receiver: on_raw:` lambda can drive the decoder too,
   // and so the same entry point is reachable from a test. Registering as a
-  // listener is the normal path; using both would just decode twice, and the
-  // press-counter dedupe would collapse the second one anyway.
+  // listener is the normal path; using both would feed every frame twice, which
+  // would be counted as a held button.
   bool process_raw(const std::vector<int32_t> &raw);
 
  protected:
-  void publish_(const Packet &packet);
+  void publish_(const Packet &packet, uint32_t repeat);
 
   std::vector<FanRfBinarySensor *> sensors_;
-  esphome::CallbackManager<void(uint8_t, uint8_t, uint32_t)> callbacks_;
-  PressFilter filter_;
+  esphome::CallbackManager<void(uint8_t, uint8_t, uint32_t, uint32_t)> callbacks_;
+  PressTracker tracker_;
 };
 
 class FanRfBinarySensor : public esphome::binary_sensor::BinarySensorInitiallyOff,
                           public esphome::Component {
  public:
-  void set_command(uint8_t command) { this->command_ = command; }
-  uint8_t get_command() const { return this->command_; }
+  void set_key(uint8_t key) { this->key_ = key; }
+  uint8_t get_key() const { return this->key_; }
+  void set_repeats(bool repeats) { this->repeats_ = repeats; }
+  bool get_repeats() const { return this->repeats_; }
   void dump_config() override;
 
  protected:
-  uint8_t command_{0};
+  uint8_t key_{0};
+  bool repeats_{true};
 };
 
-// on_code: fires once per press with (command, counter, code).
-class FanRfCodeTrigger : public esphome::Trigger<uint8_t, uint8_t, uint32_t> {
+// on_code: fires with (key, counter, code, repeat). `repeat` is 0 for the press
+// itself and 1, 2, 3... for each frame of a hold beyond it.
+class FanRfCodeTrigger : public esphome::Trigger<uint8_t, uint8_t, uint32_t, uint32_t> {
  public:
   explicit FanRfCodeTrigger(FanRfDecoder *parent) {
-    parent->add_on_code_callback(
-        [this](uint8_t command, uint8_t counter, uint32_t code) { this->trigger(command, counter, code); });
+    parent->add_on_code_callback([this](uint8_t key, uint8_t counter, uint32_t code,
+                                        uint32_t repeat) { this->trigger(key, counter, code, repeat); });
   }
 };
 

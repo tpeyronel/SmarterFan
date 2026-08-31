@@ -277,62 +277,90 @@ components:
 
 | Component | Does |
 |---|---|
-| `firmware/components/fan_rf` | The decoder. Splits a capture on gaps over 5 ms, decodes each frame independently as 32 PWM bits, majority-votes the survivors, validates the prefix and the checksum, and deduplicates on the press counter so one press produces one event. |
-| `firmware/components/fan_rf_dump` | Prints every frame that decodes as a 32-bit binary word and nothing else — no field checks, no vote, no dedupe. All-or-nothing per frame, so a corrupt frame prints nothing rather than a half-guessed word. Standalone: needs `remote_receiver` and nothing else. |
+| `firmware/components/fan_rf_dump` | The frame layer, and the only copy of it in the repo. Splits a capture on gaps over 5 ms and decodes each chunk independently as 32 PWM bits, all-or-nothing — one symbol matching neither bit throws the frame away, so a corrupt frame yields nothing rather than a half-guessed word. As a component it prints those words and does nothing else: no field checks, no dedupe. Standalone; needs `remote_receiver` and nothing else. |
+| `firmware/components/fan_rf` | The packet layer, built on that. Splits each 32-bit word into prefix, key, press counter and checksum, validates it, names the button, and counts frames to tell a tap from a hold. It `AUTO_LOAD`s `fan_rf_dump` for the header alone, so the symbol timings have exactly one definition. Name both in `external_components`, but add a `fan_rf_dump:` block only if you also want the raw frames printed — without one you get the shared decoder and no dumper. |
 | `firmware/components/adc_logger` | Streams an ADC pin's samples to the log continuously — no trigger, no thresholding — for looking at the pad as an analogue waveform. Wiring is `pad --[10k]-- GPIO3 --[10k]-- GND`; 10 kSa/s fits in the log's throughput. |
 
-The protocol itself lives in `fan_rf/fan_rf_protocol.h`, which has no ESPHome,
-Arduino or IDF dependency, so it compiles on the host.
+Both headers are free of ESPHome, Arduino and IDF dependencies, so they compile
+unchanged on the host.
 
-> ⚠️ `fan_rf` still models the frame as a 16-bit device ID plus an 8-bit command,
-> which predates the full key table. That command byte drops the low bit of
-> `KEY`, so it cannot separate the two buttons in each pair — `0x23` is both
-> *temp +* and *all off*. It validates and deduplicates correctly; it identifies
-> buttons wrongly. Port it to the `KEY`/`CNT` split in PROTOCOL.md before
-> trusting a named button.
+### Press and hold
+
+The remote has no repeat code: a held button just keeps sending the same frame,
+counter unchanged, one every 41.1 ms. Counting frames is the only way to tell a
+tap from a hold.
+
+```
+frame:  1   2   3   4   5   6   7   8  ...
+event:  P   .   .   .   .   R1  R2  R3
+        ↑ press, ~37 ms      ↑ repeats, one per frame
+```
+
+The first frame of a new codeword is the press, reported immediately rather than
+218 ms later when the burst ends. The next four are the rest of that same press
+and are swallowed, so a tap fires exactly once — even when the AGC eats frame 1
+and only four arrive. Everything past them is the button being held.
+
+A run ends when the codeword changes or after `run_timeout` (250 ms, six frame
+periods) with no frame. That timeout is what keeps the ninth press of one button
+— the counter wraps at 8, so its codeword comes round again — from reading as
+the same hold continuing. `press_frames: 1` disables the swallowing entirely and
+reports every frame the remote sends.
 
 `fan_rf` exposes decodes two ways. The trigger is the primitive:
 
 ```yaml
 fan_rf:
   id: fan_remote
+  press_frames: 5      # frames that make up one press
+  run_timeout: 250ms   # silence that ends a run
   on_code:
     - lambda: |-
-        ESP_LOGI("remote", "cmd=0x%02X counter=%u", command, counter);
+        ESP_LOGI("remote", "key=%u counter=%u repeat=%lu",
+                 key, counter, (unsigned long) repeat);
 ```
 
-and named buttons are built on it:
+`repeat` is 0 for the press itself and 1, 2, 3… for each frame of a hold. Named
+buttons are built on the same decode:
 
 ```yaml
 binary_sensor:
   - platform: fan_rf
     name: "Remote: brightness up"
-    command: brightness_up     # or a raw byte, e.g. 0x21
+    key: bright_up       # any name from PROTOCOL.md §4, or a raw 0–31 value
+
+  - platform: fan_rf
+    name: "Remote: light on/off"
+    key: light_toggle
+    repeats: false       # a hold still registers once
 ```
 
-Unknown command bytes are accepted as valid-but-unnamed — it is the prefix and
-the checksum that validate a packet, not the command.
+Sensors pulse on held repeats by default, 41.1 ms apart, which is what makes
+hold-to-dim work from an automation. An unlisted key is accepted as
+valid-but-unnamed — the prefix and the checksum are what validate a packet, not
+the key.
 
 Host-side:
 
 | Tool | Does |
 |---|---|
 | `tools/decode_fan_rf.py` | Decodes a captured log offline with generous tolerances, majority-votes the repeats, and checks that the counter increments by exactly one per press — an end-to-end check that nothing was dropped. |
-| `tools/fan_rf_selftest.cpp` | Compiles `fan_rf_protocol.h` on the host and replays captured logs through it, so the firmware decoder is validated against real data before anything is flashed. A disagreement with `decode_fan_rf.py` is a real signal about the component. |
+| `tools/fan_rf_selftest.cpp` | Compiles the firmware's own headers on the host and checks them: the full key table against the codewords in PROTOCOL.md, the checksum against every single-bit corruption, and the press/repeat state machine end to end through synthesised bursts — clean, AGC-skewed, frame 1 destroyed, held, and pure noise. Needs no capture log. Give it one and it replays that too. |
 | `tools/plot_adc.py`, `tools/adclog_to_csv.py` | Plot and convert `adc_logger` output. Dropped log lines are reported and drawn as gaps, never closed up. |
 
 ```
 c++ -std=c++17 -O2 -o /tmp/fan_rf_selftest tools/fan_rf_selftest.cpp
-/tmp/fan_rf_selftest --frames log.txt      # decoded presses, counter +1 each
-/tmp/fan_rf_selftest --dump   log.txt      # what fan_rf_dump would print
+/tmp/fan_rf_selftest                       # 527 checks, no log needed
+/tmp/fan_rf_selftest log.txt               # replay a capture through the decoder
+/tmp/fan_rf_selftest --dump log.txt        # what fan_rf_dump would print
 ```
 
 ### Two settings that matter
 
 **`idle: 4ms`** is deliberately shorter than the 8.79 ms inter-frame gap, so each
-of the five repeats ends its own capture. `fan_rf` deduplicates on the press
-counter, so five captures still produce one event, and a press is reported ~37 ms
-after the first frame instead of ~218 ms after the whole burst. A longer idle
+of the five repeats ends its own capture. `fan_rf` counts frames rather than
+captures, so five captures still produce one press, and that press is reported
+~37 ms after the first frame instead of ~218 ms after the whole burst. A longer idle
 that holds a whole burst in one capture never terminates while a button is held —
 frames arrive every 41.1 ms — until `receive_symbols` fills and the driver
 truncates. The safe window is bounded below by the 865 µs longest in-frame space
@@ -488,7 +516,7 @@ There is also a mechanical limit that no controller can beat. Blade deployment i
 
 🚧 Early. Reverse engineering done, no hardware built yet. See [Unknown](#-unknown--measure-before-building) for the measurements blocking the first build.
 
-The remote is fully solved — wire format, frame layout, checksum and all 20 buttons, documented in [PROTOCOL.md](PROTOCOL.md) and decoded on-device by `fan_rf`. What remains on the RF side is porting `fan_rf` to the `KEY`/`CNT` frame model and building the transmit path; everything else is hardware work.
+The remote is fully solved — wire format, frame layout, checksum and all 20 buttons, documented in [PROTOCOL.md](PROTOCOL.md) and decoded on-device by `fan_rf`, which identifies every button and distinguishes a tap from a hold. What remains on the RF side is the transmit path; everything else is hardware work.
 
 ## License
 

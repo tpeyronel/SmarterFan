@@ -1,46 +1,56 @@
 #!/usr/bin/env python3
 """Decode Novohome NH-VTR500 remote packets from an ESPHome `dump: raw` log.
 
-Usage:  tools/decode_fan_rf.py log2.txt [...]
+Usage:  tools/decode_fan_rf.py log.txt [...]
 
-Wire format (reverse-engineered from log.txt + log2.txt, 21:58 and 23:05
-capture sessions):
+An offline second opinion on what the firmware decoder saw. The protocol is
+documented in full in PROTOCOL.md; in brief:
 
     335us mark, 7.7ms gap                 preamble
     then 5x { 32 data bits, ~330us stop mark, 8.79ms gap }
 
-    bit 0 = 269us mark + 740us space      bit period ~1009us
-    bit 1 = 768us mark + 242us space
+    tick = 252us, bit period 4 ticks
+    bit 0 = 1 tick mark + 3 tick space
+    bit 1 = 3 tick mark + 1 tick space
 
-Packet (32 bits, MSB first):
+Packet, 32 bits MSB first:
 
-    [ 0..15] 0xA1D8   remote / device ID
-    [16..23] command  0x21 brightness+, 0x23 colour temp+, 0x28 fan speed 1
-    [24..27] high nibble = [domain flag][3-bit press counter]
-    [28..31] low nibble  = high nibble XOR (command & 0x0F) XOR 6
+    [31..12] prefix   constant 0xA1D82
+    [11.. 7] KEY      which button, a lookup table (PROTOCOL.md section 4)
+    [ 6.. 4] CNT      press counter, +1 mod 8 per press of any button
+    [ 3.. 0] CS       (word >> 8 & 0xF) ^ (word >> 4 & 0xF) ^ 6
 
-The press counter advances +1 mod 8 on every press of any button, and is
-identical across the five repeats of one press.
-
-The domain flag is 1 for the light commands (0x21, 0x23) and 0 for the fan
-command (0x28) — i.e. the inverse of command bit 3, consistent with the
-command space being split 0x20-0x27 light / 0x28-0x2F fan. Bit 28 reads as a
-constant 1 in every packet so far, but that is a *consequence* of the nibble
-rule rather than a marker: flag XOR (command bit 3) is 1 by construction.
+The press counter advances on every press of any button and is identical
+across the five repeats of one press, so this script uses a change in the
+counter to tell a new press from a retransmission.
 """
 
 import re
 import sys
 from collections import Counter
 
-# Nominal symbol timings in microseconds, measured over uncorrupted frames.
-MARK_SHORT, MARK_LONG = 269, 768
-SPACE_SHORT, SPACE_LONG = 242, 740
+# Nominal symbol timings in microseconds: one 252us tick, 1:3 PWM.
+MARK_SHORT, MARK_LONG = 252, 756
+SPACE_SHORT, SPACE_LONG = 252, 756
 GAP_MIN = 5000          # anything longer than this separates frames
 TOL = 0.45              # generous: we validate structurally afterwards
 
-DEVICE_ID = 0xA1D8
-COMMANDS = {0x21: "brightness+", 0x23: "colour temp+", 0x28: "fan speed 1"}
+# This deliberately matches on width alone, with no bit-period check, where the
+# firmware decoder checks both. Two different tests over the same capture make
+# a disagreement between them worth investigating.
+
+PREFIX = 0xA1D82
+CHECK_XOR = 6
+
+# Transcribed from PROTOCOL.md section 4. KEY is a lookup, not an encoding:
+# the values are not contiguous and nothing about a code predicts its button.
+KEYS = {
+    3: "bright+", 4: "fan forward", 5: "bright-", 6: "all off",
+    7: "temp+", 8: "light on/off", 9: "2H", 10: "fan 4",
+    11: "temp-", 12: "fan 6", 13: "cycle full bright", 15: "fan 5",
+    16: "fan 1", 17: "fan reverse", 18: "fan 2", 19: "night mode",
+    21: "natural wind", 22: "fan off", 25: "4H", 28: "fan 3",
+}
 
 
 def parse_captures(text):
@@ -104,21 +114,20 @@ def decode_frame(frame):
 
 
 def decode_packet(bits):
-    """Split a 32-bit codeword into fields and verify the check nibble."""
-    device = int(bits[0:16], 2)
-    command = int(bits[16:24], 2)
-    high = int(bits[24:28], 2)          # [domain flag][counter:3]
-    low = int(bits[28:32], 2)           # check nibble
+    """Split a 32-bit codeword into fields and verify the checksum."""
+    word = int(bits, 2)
+    n5, n6, n7 = (word >> 8) & 0xF, (word >> 4) & 0xF, word & 0xF
+    key = (word >> 7) & 0x1F
     return {
-        "device": device,
-        "command": command,
-        "name": COMMANDS.get(command, "UNKNOWN"),
-        "domain": high >> 3,
-        "counter": high & 7,
-        "check": low,
-        "check_ok": low == (high ^ (command & 0x0F) ^ 6),
-        "domain_ok": (high >> 3) == (0 if command & 0x08 else 1),
-        "device_ok": device == DEVICE_ID,
+        "prefix": word >> 12,
+        "key": key,
+        # An unlisted KEY is valid-but-unnamed: the prefix and the checksum
+        # are what say a packet is real, not the button.
+        "name": KEYS.get(key, "UNKNOWN"),
+        "counter": (word >> 4) & 7,
+        "check": n7,
+        "check_ok": (n5 ^ n6 ^ n7) == CHECK_XOR,
+        "prefix_ok": (word >> 12) == PREFIX,
     }
 
 
@@ -133,7 +142,7 @@ def main(paths):
 
         print(f"\n=== {path}: {len(captures)} captures ===")
         print(f"{'time':<13} {'frames':>6} {'ok':>3}  {'code':<34} "
-              f"{'cmd':<14} {'ctr':>3} {'chk':>3}")
+              f"{'key':>3} {'button':<18} {'ctr':>3} {'chk':>3}")
 
         for timestamp, durations in captures:
             frames = split_frames(durations)[1:]      # drop preamble
@@ -147,12 +156,11 @@ def main(paths):
             bits, votes = Counter(decoded).most_common(1)[0]
             packet = decode_packet(bits)
             flags = "".join([
-                "" if packet["device_ok"] else " BAD-ID",
-                "" if packet["domain_ok"] else " BAD-DOMAIN",
+                "" if packet["prefix_ok"] else " BAD-PREFIX",
                 "" if packet["check_ok"] else " BAD-CHECK",
             ])
             print(f"{timestamp:<13} {len(frames):>6} {votes:>3}  {bits:<34} "
-                  f"0x{packet['command']:02X} {packet['name']:<9} "
+                  f"{packet['key']:>3} {packet['name']:<18} "
                   f"{packet['counter']:>3} {packet['check']:>3}{flags}")
             presses.append(packet)
 
@@ -160,10 +168,9 @@ def main(paths):
         return 1
 
     print(f"\n=== summary: {len(presses)} presses ===")
-    print("commands seen:", {f"0x{c:02X}": n for c, n in
-                             Counter(p["command"] for p in presses).items()})
-    bad = [p for p in presses if not (p["check_ok"] and p["device_ok"]
-                                      and p["domain_ok"])]
+    print("buttons seen:", {KEYS.get(k, f"key {k}"): n for k, n in
+                            Counter(p["key"] for p in presses).items()})
+    bad = [p for p in presses if not (p["check_ok"] and p["prefix_ok"])]
     print(f"field checks: {len(presses) - len(bad)}/{len(presses)} pass")
 
     counters = [p["counter"] for p in presses]

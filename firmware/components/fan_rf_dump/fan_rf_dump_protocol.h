@@ -1,25 +1,25 @@
-// Frame decoder for the Novohome NH-VTR500 remote -- standalone copy.
+// Frame decoder for the Novohome NH-VTR500 remote.
 //
-// Self-contained on purpose. This component depends on nothing but
-// `remote_receiver`: no ESPHome headers here, no Arduino, no IDF, and
-// deliberately no reach into the sibling `fan_rf` component. Drop this
-// directory into any ESPHome project and it works on its own.
+// The frame layer for the whole repo, and the only definition of it: turn a
+// capture into 32-bit codewords, and nothing beyond that -- no field split, no
+// validation, no dedupe. The sibling `fan_rf` component includes this header
+// for its decoder rather than carrying a copy, so re-measuring the remote
+// changes one file. Nothing here reaches back the other way.
 //
-// The cost of that is real and worth stating: the symbol timings below also
-// exist in fan_rf/fan_rf_protocol.h. If the remote is ever re-measured and the
-// nominals move, they must move in both places.
+// Self-contained: no ESPHome headers, no Arduino, no IDF. The component around
+// it depends on nothing but `remote_receiver`, so this directory can be dropped
+// into any ESPHome project on its own, and the header compiles straight into
+// tools/fan_rf_selftest.cpp -- what is validated on the host is literally what
+// runs on the device.
 //
-// The header is free of framework dependencies so it can be compiled straight
-// into tools/fan_rf_selftest.cpp, which replays captured logs through it. What
-// is validated offline is then literally what runs on the device.
+// Wire format, documented in full in PROTOCOL.md section 1:
 //
-// Wire format
-// -----------
 //   [~350us mark][7.69ms gap]                         preamble, once
 //   then 5x [32 data bits][~330us stop mark][8.79ms gap]
 //
-//   bit 0 = 288us mark + 704us space      bit period ~1009us
-//   bit 1 = 800us mark + 224us space
+//   tick = 252us, bit period 4 ticks = 1009us measured
+//   bit 0 = 1 tick mark + 3 tick space
+//   bit 1 = 3 tick mark + 1 tick space
 
 #pragma once
 
@@ -43,19 +43,12 @@ namespace fan_rf_dump {
 // frame of a burst while the AGC settles). That bias is common-mode, so it
 // cancels in mark+space and leaves the period untouched -- which is why the
 // period is checked separately below and is by far the strongest test here.
-//
-// An earlier revision used 288/800/224/704. Those were not measurements: they
-// are 9/25/7/22 x 32, the grid imposed by the deleted rc_switch profile's
-// `pulse_length: 32`. They sat further from the measured centres (23.5us
-// average error) than these do (16.5us).
 static const uint32_t SHORT_US = 252;
 static const uint32_t LONG_US = 756;
 
 // Width slack, percent. Wide on purpose: with the period check carrying the
 // selectivity, this is a sanity rail on each pulse rather than the primary
-// discriminator. 50% is where the frame yield plateaus, and it makes the
-// filter a strict superset of the old 288/800/224/704 at 40% -- every frame
-// that decoded before still decodes, with identical bits.
+// discriminator. 50% is where the frame yield plateaus.
 static const uint32_t WIDTH_TOLERANCE_PCT = 50;
 
 // Bit period, and the real discriminator. Measured mean 1009.1us with a

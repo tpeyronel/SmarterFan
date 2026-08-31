@@ -5,13 +5,16 @@ receiver actually deliver". It applies exactly one test -- do the pulses match
 the remote's two symbol widths -- and prints the frames that pass. Nothing is
 validated, voted on or deduplicated, so what you read is what arrived.
 
-Standalone: it needs `remote_receiver` and nothing else. Its frame decoder is
-its own, in fan_rf_dump_protocol.h, so this directory can be dropped into any
-project on its own. The trade is that the symbol timings also exist in
-`fan_rf` -- re-measure the remote and both have to change.
+Standalone: it needs `remote_receiver` and nothing else, so this directory can
+be dropped into any project on its own. It is also where the frame decoder
+lives for the whole repo -- `fan_rf` includes fan_rf_dump_protocol.h rather than
+carrying a copy, so the symbol timings have exactly one definition.
 
-It can run alongside `fan_rf`: every listener sees every capture, so running
-both costs nothing but the decode.
+Because of that, `fan_rf` AUTO_LOADs this component for the header alone.
+MULTI_CONF_NO_DEFAULT below is what keeps that from creating a dumper nobody
+asked for: no `fan_rf_dump:` block in the config means no instance, just the
+source in the build. Add the block to get the frames printed; the two then run
+side by side, since every listener sees every capture.
 """
 
 import esphome.codegen as cg
@@ -22,6 +25,8 @@ from esphome.const import CONF_ID
 CODEOWNERS = ["@torval"]
 DEPENDENCIES = ["remote_receiver"]
 MULTI_CONF = True
+# AUTO_LOAD from `fan_rf` must not conjure an instance -- see the docstring.
+MULTI_CONF_NO_DEFAULT = True
 
 smarterfan_ns = cg.global_ns.namespace("smarterfan")
 fan_rf_dump_ns = smarterfan_ns.namespace("fan_rf_dump")
