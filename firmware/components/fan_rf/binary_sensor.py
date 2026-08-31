@@ -17,49 +17,15 @@ import esphome.codegen as cg
 from esphome.components import binary_sensor
 import esphome.config_validation as cv
 
-from . import CONF_FAN_RF_ID, FanRfDecoder, fan_rf_ns
+from . import CONF_FAN_RF_ID, CONF_KEY, FanRfDecoder, fan_rf_ns, validate_key
 
 DEPENDENCIES = ["fan_rf"]
 
-CONF_KEY = "key"
 CONF_REPEATS = "repeats"
 
 FanRfBinarySensor = fan_rf_ns.class_(
     "FanRfBinarySensor", binary_sensor.BinarySensor, cg.Component
 )
-
-# The remote's full key table, from PROTOCOL.md section 4. KEY is a lookup, not
-# an encoding -- the values are not contiguous and nothing about a code predicts
-# its button, so this table is transcribed, never computed. A raw 0-31 value is
-# accepted too, for a button this remote does not have.
-KEYS = {
-    "bright_up": 3,
-    "fan_forward": 4,
-    "bright_down": 5,
-    "all_off": 6,
-    "colour_temp_up": 7,
-    "light_toggle": 8,
-    "timer_2h": 9,
-    "fan_4": 10,
-    "colour_temp_down": 11,
-    "fan_6": 12,
-    "cycle_full_bright": 13,
-    "fan_5": 15,
-    "fan_1": 16,
-    "fan_reverse": 17,
-    "fan_2": 18,
-    "night_mode": 19,
-    "natural_wind": 21,
-    "fan_off": 22,
-    "timer_4h": 25,
-    "fan_3": 28,
-}
-
-
-def validate_key(value):
-    if isinstance(value, str) and value.lower() in KEYS:
-        return KEYS[value.lower()]
-    return cv.int_range(min=0, max=31)(value)
 
 
 CONFIG_SCHEMA = (

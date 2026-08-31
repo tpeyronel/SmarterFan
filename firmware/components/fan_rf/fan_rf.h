@@ -11,12 +11,18 @@
 // five repeats is its own capture, at 12 ms all five sit in one, and either way
 // a tap produces one event and a hold produces one event plus a repeat per
 // extra frame.
+//
+// The relay hangs off the same events. RelayGate decides tap versus hold and
+// says what to put on the wire; all this file does is turn that answer into a
+// remote_transmitter call. The decision, the waveform and the transmitted
+// counter all live in fan_rf_protocol.h, where they can be tested on the host.
 
 #pragma once
 
 #include "esphome/core/component.h"
 #include "esphome/core/hal.h"
 #include "esphome/core/log.h"
+#include "esphome/core/automation.h"
 #include "esphome/components/binary_sensor/binary_sensor.h"
 #include "esphome/components/remote_base/remote_base.h"
 
@@ -41,13 +47,24 @@ class FanRfDecoder : public esphome::Component, public esphome::remote_base::Rem
   void set_run_timeout(uint32_t ms) { this->tracker_.set_run_timeout_ms(ms); }
   void set_dump_frames(bool dump) { this->dump_frames_ = dump; }
   void set_dump_commands(bool dump) { this->dump_commands_ = dump; }
+  void set_transmitter(esphome::remote_base::RemoteTransmitterBase *transmitter) {
+    this->transmitter_ = transmitter;
+  }
+  void set_relay_mode(RelayMode mode) { this->relay_mode_ = mode; }
+  void set_relay_decision(uint32_t ms) { this->gate_.set_decision_delay_ms(ms); }
+  void set_tap_frames(uint8_t frames) { this->gate_.set_tap_frames(frames); }
   void register_binary_sensor(FanRfBinarySensor *sensor) { this->sensors_.push_back(sensor); }
   void add_on_code_callback(std::function<void(uint8_t, uint8_t, uint32_t, uint32_t)> &&callback) {
     this->callbacks_.add(std::move(callback));
   }
 
   void dump_config() override;
+  void loop() override;
   bool on_receive(esphome::remote_base::RemoteReceiveData data) override;
+
+  // One press of a button, originated here rather than relayed. Behind the
+  // `fan_rf.send_key` action.
+  void send_key(uint8_t key);
 
   // Exposed so a `remote_receiver: on_raw:` lambda can drive the decoder too,
   // and so the same entry point is reachable from a test. Registering as a
@@ -57,10 +74,15 @@ class FanRfDecoder : public esphome::Component, public esphome::remote_base::Rem
 
  protected:
   void publish_(const Packet &packet, uint32_t repeat);
+  void relay_(const Packet &packet, uint32_t repeat, uint32_t now);
+  void inject_(const InjectPlan &plan);
 
   std::vector<FanRfBinarySensor *> sensors_;
   esphome::CallbackManager<void(uint8_t, uint8_t, uint32_t, uint32_t)> callbacks_;
   PressTracker tracker_;
+  RelayGate gate_;
+  esphome::remote_base::RemoteTransmitterBase *transmitter_{nullptr};
+  RelayMode relay_mode_{RELAY_ALL};
   bool dump_frames_{false};
   bool dump_commands_{true};
 };
@@ -87,6 +109,21 @@ class FanRfCodeTrigger : public esphome::Trigger<uint8_t, uint8_t, uint32_t, uin
     parent->add_on_code_callback([this](uint8_t key, uint8_t counter, uint32_t code,
                                         uint32_t repeat) { this->trigger(key, counter, code, repeat); });
   }
+};
+
+// TEMPLATABLE_VALUE names TemplatableStorage unqualified, and this component
+// lives outside the esphome namespace, so it has to be visible here.
+using esphome::TemplatableStorage;
+
+// fan_rf.send_key: one press of a named button or a raw 0-31 key, on the
+// ESP32's own counter. No hold -- a held command is a stream, and nothing here
+// knows when Home Assistant would want it to stop.
+template<typename... Ts>
+class FanRfSendKeyAction : public esphome::Action<Ts...>, public esphome::Parented<FanRfDecoder> {
+ public:
+  TEMPLATABLE_VALUE(uint8_t, key)
+
+  void play(Ts... x) override { this->parent_->send_key(this->key_.value(x...)); }
 };
 
 }  // namespace fan_rf

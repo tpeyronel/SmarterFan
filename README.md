@@ -271,16 +271,22 @@ Three properties of it shape the rest of this project:
 
 ## Tooling
 
-Receive-side only, and none of it needs the board modified — just the sniff tap.
-`firmware/sniffer.yaml` is the ESPHome build, and it loads two local components:
+Two ESPHome builds, both loading local components out of `firmware/components`:
+
+| Build | Needs | Does |
+|---|---|---|
+| `firmware/sniffer.yaml` | just the sniff tap — **no board modification** | Decodes the remote and prints it. This is the bring-up config and it stays receive-only. |
+| `firmware/relay.yaml` | the `102` removed and a shifter on both lines | The same decode, plus injection into the OEM MCU's RF input and a `fan_rf.send_key` action for Home Assistant. |
 
 | Component | Does |
 |---|---|
-| `firmware/components/fan_rf` | The decoder, in three stages. **Capture → frames:** split on gaps over 5 ms and decode each chunk independently as 32 PWM bits, all-or-nothing — one symbol matching neither bit throws the frame away, so a corrupt frame yields nothing rather than a half-guessed word. **Frame → packet:** split the word into prefix, key, press counter and checksum, and validate it. **Packets → presses:** count identical codewords to tell a tap from a hold. Nothing lower reaches up; the frame decoder has no idea what a press is. |
+| `firmware/components/fan_rf` | The decoder, in three stages. **Capture → frames:** split on gaps over 5 ms and decode each chunk independently as 32 PWM bits, all-or-nothing — one symbol matching neither bit throws the frame away, so a corrupt frame yields nothing rather than a half-guessed word. **Frame → packet:** split the word into prefix, key, press counter and checksum, and validate it. **Packets → presses:** count identical codewords to tell a tap from a hold. Nothing lower reaches up; the frame decoder has no idea what a press is. Two more stages sit on top for transmit: **packet → waveform**, the bit builders run backwards, and **presses → injection**, the relay decision below. |
 | `firmware/components/adc_logger` | Streams an ADC pin's samples to the log continuously — no trigger, no thresholding — for looking at the pad as an analogue waveform. Wiring is `pad --[10k]-- GPIO3 --[10k]-- GND`; 10 kSa/s fits in the log's throughput. |
 
-All three stages live in `fan_rf/fan_rf_protocol.h`, free of ESPHome, Arduino
-and IDF dependencies, so it compiles unchanged on the host.
+Every stage lives in `fan_rf/fan_rf_protocol.h`, free of ESPHome, Arduino and
+IDF dependencies, so it compiles unchanged on the host. `fan_rf.cpp` is
+plumbing: the console dumps, the binary sensors, and turning the relay's
+decision into a `remote_transmitter` call.
 
 ### Watching the pipeline
 
@@ -362,17 +368,89 @@ hold-to-dim work from an automation. An unlisted key is accepted as
 valid-but-unnamed — the prefix and the checksum are what validate a packet, not
 the key.
 
+### Relaying
+
+`firmware/relay.yaml` adds a `remote_transmitter` on GPIO 5 and turns decoded
+presses back into frames on the MCU's input. **Not tested against hardware —
+none exists yet.** What follows is the design, not a measurement.
+
+**Nothing is transmitted on the press event.** The wait is the point: the press
+fires on the first frame, and only what happens next says whether the button was
+tapped or is being held.
+
+```
+frame:    1   2   3   4   5   6   7   8
+event:    P   .   .   .   .   R1  R2  R3
+inject:   .   .   .   .   .   F   F   F      held  — starts at the first repeat
+inject:   .   .   .   .   . F                tapped — starts at the deadline
+```
+
+- **A repeat arrives first — it is a hold.** Inject immediately, then one more
+  frame for every further repeat, so the injected stream tracks the hold in real
+  time and stops when the button is released.
+- **The deadline passes with no repeat — it was a tap.** Inject one frame.
+
+The preamble goes out once, at the start of either. One received repeat every
+41.1 ms against one injected frame occupying 41.4 ms is what keeps the stream in
+step: nothing queues and nothing overlaps.
+
+`relay_decision` is the deadline, and it is pure added latency on every tap. It
+cannot go below `press_frames` × 41.1 ms = 205 ms, which is where the first
+repeat of a held button lands. The default 230 ms is that plus jitter, and
+deliberately *not* a whole extra frame period of margin for a dropped sixth
+frame: if that frame is lost the deadline fires and one frame goes out, and
+because a tap and the first frame of a hold are the same frame on the same
+counter, the repeat behind it simply extends the stream. Lowering `press_frames`
+shortens both windows together.
+
+**The ESP32 owns the transmitted counter.** Once the `102` is removed the MCU
+hears only the ESP32, so there is one counter sequence reaching it and nothing
+to collide with. It advances once per injected press and holds for every frame
+of that press — a counter that moved per frame would make a hold read as a
+stream of separate presses, which is the whole thing the counter exists to
+prevent. It is tracked independently of the counter observed from the remote,
+and it is **not** persisted across a reboot: the ESP32 and the MCU share the
+fan's secondary rail, so a power cycle resets both, and the two can only
+disagree after an ESP32-only restart (OTA or a watchdog reset). The cost then is
+at most one ignored command.
+
+`relay: all` forwards every button. `relay: fan` drops the six light keys and is
+what this becomes once the ESP32 drives the LEDs itself — which does not exist
+yet, so switching now would just stop the light working. The split is a hand
+transcription from the button names, not a computation: `bright ±`, `temp ±`,
+`light on/off` and `cycle full bright` are light; `fan 1`–`fan 6`, `fan off`,
+`fan forward` and `fan reverse` are fan; **`all off`, `night mode`, `natural
+wind`, `2H` and `4H` are unverified** — nobody has pressed them with the fan
+running and watched what moved — so `fan` mode forwards them, on the grounds
+that dropping a button whose effect is unknown breaks something that works.
+
+Commands can also originate on the ESP32:
+
+```yaml
+on_press:
+  - fan_rf.send_key: fan_1        # a name from PROTOCOL.md §4, or a raw 0–31
+```
+
+One press, on the ESP32's own counter. No hold support in this pass.
+
+**Two things this depends on and neither is measured.** Whether the MCU dedupes
+on the counter at all is an inference from what the *remote* does; if it does
+not, the counter policy costs nothing. And whether it accepts a single injected
+frame is untested — the remote sends five, but that redundancy buys margin on a
+noisy RF link and this goes over a wire. `tap_frames` is the knob if one turns
+out not to be enough.
+
 Host-side:
 
 | Tool | Does |
 |---|---|
 | `tools/decode_fan_rf.py` | Decodes a captured log offline with generous tolerances, majority-votes the repeats, and checks that the counter increments by exactly one per press — an end-to-end check that nothing was dropped. |
-| `tools/fan_rf_selftest.cpp` | Compiles the firmware's own header on the host and checks it: the full key table against the codewords in PROTOCOL.md, the checksum against every single-bit corruption, and the press/repeat state machine end to end through synthesised bursts — clean, AGC-skewed, frame 1 destroyed, held, and pure noise. Needs no capture log. Give it one and it replays that too. |
+| `tools/fan_rf_selftest.cpp` | Compiles the firmware's own header on the host and checks it: the full key table against the codewords in PROTOCOL.md, the checksum against every single-bit corruption, and the press/repeat state machine end to end through synthesised bursts — clean, AGC-skewed, frame 1 destroyed, held, and pure noise. The transmit path is checked by feeding what it emits straight back through the receive path, which is the validated one, plus literal assertions on the emitted durations. Needs no capture log. Give it one and it replays that too. |
 | `tools/plot_adc.py`, `tools/adclog_to_csv.py` | Plot and convert `adc_logger` output. Dropped log lines are reported and drawn as gaps, never closed up. |
 
 ```
 c++ -std=c++17 -O2 -o /tmp/fan_rf_selftest tools/fan_rf_selftest.cpp
-/tmp/fan_rf_selftest                       # 529 checks, no log needed
+/tmp/fan_rf_selftest                       # 858 checks, no log needed
 /tmp/fan_rf_selftest log.txt               # replay a capture through the decoder
 /tmp/fan_rf_selftest --dump log.txt        # what dump_frames would print
 ```
@@ -529,7 +607,9 @@ There is also a mechanical limit that no controller can beat. Blade deployment i
 
 🚧 Early. Reverse engineering done, no hardware built yet. See [Unknown](#-unknown--measure-before-building) for the measurements blocking the first build.
 
-The remote is fully solved — wire format, frame layout, checksum and all 20 buttons, documented in [PROTOCOL.md](PROTOCOL.md) and decoded on-device by `fan_rf`, which identifies every button and distinguishes a tap from a hold. What remains on the RF side is the transmit path; everything else is hardware work.
+The remote is fully solved — wire format, frame layout, checksum and all 20 buttons, documented in [PROTOCOL.md](PROTOCOL.md) and decoded on-device by `fan_rf`, which identifies every button and distinguishes a tap from a hold.
+
+The RF path is now written in both directions. `firmware/relay.yaml` builds, reconstructs frames and injects them on GPIO 5, and exposes `fan_rf.send_key` to Home Assistant; the round trip is checked on the host by feeding what the transmitter emits back through the decoder. **None of it has met the board** — there is no modified board and nothing has been on a scope. What remains on the RF side is confirming that against hardware; everything else is hardware work and the LED path.
 
 ## License
 

@@ -1,6 +1,7 @@
-// Novohome NH-VTR500 433 MHz OOK remote -- the whole decoder.
+// Novohome NH-VTR500 433 MHz OOK remote -- the whole decoder, and the relay
+// that puts it back on the wire.
 //
-// Three stages, in order, each one strictly above the last:
+// Five stages, in order, each one strictly above the last:
 //
 //   1. raw capture -> frames    walk_frames(), decode_frame()
 //        Split a capture on the inter-frame gap and turn each chunk into a
@@ -10,6 +11,10 @@
 //        say whether it is real. Knows about fields and nothing else.
 //   3. packets -> presses       PressTracker
 //        Count identical codewords to tell a tap from a held button.
+//   4. packet -> waveform       build_preamble(), build_frame()
+//        Stage 1 backwards: a key and a counter out as signed durations.
+//   5. presses -> injection     RelayGate
+//        Decide tap versus hold, then say what to put on the wire and when.
 //
 // Nothing lower reaches up: the frame decoder has no idea what a press is.
 //
@@ -343,6 +348,279 @@ class PressTracker {
   uint32_t run_timeout_ms_{DEFAULT_RUN_TIMEOUT_MS};
   uint8_t press_frames_{DEFAULT_PRESS_FRAMES};
   bool primed_{false};
+};
+
+// --- stage 4: packet -> waveform --------------------------------------------
+//
+// Stage 1 run backwards, for the relay: turn a codeword into the signed
+// durations remote_transmitter wants. Same convention decode_frame() reads --
+// marks positive, spaces negative -- so the receive path, which is already
+// validated against real captures, doubles as the oracle for this one.
+//
+// Nominal timings only. The AGC skew in PROTOCOL.md section 1 is what the OEM
+// receiver does to a signal on the way in; putting it back on the way out
+// would be copying a measurement artefact into the transmitter.
+
+static const uint32_t PREAMBLE_MARK_US = 335;
+static const uint32_t PREAMBLE_GAP_US = 7690;
+static const uint32_t STOP_MARK_US = 330;
+static const uint32_t GAP_US = 8787;
+
+// Entries each builder writes. A frame is 32 (mark, space) pairs, then the stop
+// mark and the gap behind it.
+static const size_t PREAMBLE_ENTRIES = 2;
+static const size_t FRAME_ENTRIES = PACKET_BITS * 2 + 2;
+
+// Airtime of one frame including its trailing gap. This is the cadence a held
+// button runs at, and therefore the cadence an injected stream has to keep: one
+// frame in per received repeat, each occupying the interval until the next.
+static const uint32_t FRAME_PERIOD_US = PACKET_BITS * (SHORT_US + LONG_US) + STOP_MARK_US + GAP_US;
+
+// The lone mark that opens a burst, emitted once ahead of the first frame.
+// Returns entries written, or 0 if `cap` is too small.
+inline size_t build_preamble(int32_t *out, size_t cap) {
+  if (cap < PREAMBLE_ENTRIES)
+    return 0;
+  out[0] = (int32_t) PREAMBLE_MARK_US;
+  out[1] = -(int32_t) PREAMBLE_GAP_US;
+  return PREAMBLE_ENTRIES;
+}
+
+// One frame for a button at a given press counter: 32 bits MSB first, the stop
+// mark, and the inter-frame gap.
+inline size_t build_frame(uint8_t key, uint8_t counter, int32_t *out, size_t cap) {
+  if (cap < FRAME_ENTRIES)
+    return 0;
+  const uint32_t word = encode_packet(key, counter);
+  size_t n = 0;
+  for (uint32_t i = 0; i < PACKET_BITS; i++) {
+    const bool one = (word >> (PACKET_BITS - 1 - i)) & 1u;
+    out[n++] = (int32_t) (one ? LONG_US : SHORT_US);
+    out[n++] = -(int32_t) (one ? SHORT_US : LONG_US);
+  }
+  out[n++] = (int32_t) STOP_MARK_US;
+  out[n++] = -(int32_t) GAP_US;
+  return n;
+}
+
+// --- which half of the fan a button drives ----------------------------------
+//
+// Read off the button names in PROTOCOL.md section 4, never computed: KEY is a
+// lookup table and nothing in a code predicts what it does.
+//
+// The relay forwards everything today. It narrows to the fan only once the
+// ESP32 drives the LEDs itself, which does not exist yet -- so this exists to
+// make that a config change rather than a rewrite.
+enum KeyDomain : uint8_t {
+  DOMAIN_FAN,
+  DOMAIN_LIGHT,
+  // Could act on the fan, the light or both. UNVERIFIED means exactly that: no
+  // one has pressed these with the fan running and watched what moved.
+  DOMAIN_UNVERIFIED,
+};
+
+inline KeyDomain key_domain(uint8_t key) {
+  switch (key) {
+    case KEY_BRIGHT_UP:
+    case KEY_BRIGHT_DOWN:
+    case KEY_TEMP_UP:
+    case KEY_TEMP_DOWN:
+    case KEY_LIGHT_TOGGLE:
+    case KEY_CYCLE_FULL_BRIGHT:
+      return DOMAIN_LIGHT;
+    case KEY_FAN_1:
+    case KEY_FAN_2:
+    case KEY_FAN_3:
+    case KEY_FAN_4:
+    case KEY_FAN_5:
+    case KEY_FAN_6:
+    case KEY_FAN_OFF:
+    case KEY_FAN_FORWARD:
+    case KEY_FAN_REVERSE:
+      return DOMAIN_FAN;
+    // all off, night mode, natural wind, 2H and 4H land here, and so does any
+    // key this remote does not have.
+    default:
+      return DOMAIN_UNVERIFIED;
+  }
+}
+
+enum RelayMode : uint8_t {
+  RELAY_NONE,  // decode only, inject nothing -- bring-up, and send_key still works
+  RELAY_FAN,
+  RELAY_ALL,
+};
+
+inline bool relay_key(RelayMode mode, uint8_t key) {
+  switch (mode) {
+    case RELAY_ALL:
+      return true;
+    // Fan mode forwards the unverified keys too. Dropping a button whose effect
+    // is unknown breaks something that works today; forwarding one that turns
+    // out to be light-only just leaves the OEM behaviour where it already is.
+    case RELAY_FAN:
+      return key_domain(key) != DOMAIN_LIGHT;
+    default:
+      return false;
+  }
+}
+
+// --- stage 5: presses -> injection ------------------------------------------
+//
+// Nothing goes on the wire on the press event itself, and the waiting is the
+// point. PressTracker reports a press on the first frame; only the arrival, or
+// not, of a repeat says whether the button was tapped or is being held.
+//
+//   repeat first    -> a hold. Inject immediately, then one more frame for
+//                      every further repeat, so the injected stream tracks the
+//                      hold in real time and stops when the button is released.
+//   deadline first  -> a tap. Inject TAP_FRAMES frames, once.
+//
+// The preamble goes out once, at the start of either.
+//
+// One received repeat every frame period against one injected frame occupying
+// a frame period is what keeps the stream in step: nothing queues, nothing
+// overlaps.
+//
+// The counter is ours, not the remote's. Once the 102 is removed the MCU hears
+// only the ESP32, so there is a single sequence reaching it and nothing to
+// collide with. It advances once per injected press and holds for every frame
+// of that press: a counter that moved per frame would make a hold read as a
+// stream of separate presses, which is the one thing the counter exists to
+// prevent.
+//
+// ASSUMPTION: that the MCU dedupes on the counter at all. PROTOCOL.md section 2
+// describes what the *remote* does with it; nothing here has measured what the
+// receiver makes of it. If the MCU ignores the counter entirely, this policy
+// costs nothing -- it just makes every frame of a press identical, which is
+// what the remote sends anyway.
+//
+// Time is passed in, the same way PressTracker takes it, so the decision is
+// host-testable with no clock and no framework.
+
+// Past where the sixth frame would arrive -- the tracker swallows PRESS_FRAMES
+// frames, so the first repeat lands PRESS_FRAMES frame periods after the press
+// event. See the note on relay_decision in firmware/relay.yaml for the choice.
+static const uint32_t DEFAULT_DECISION_DELAY_MS = 230;
+
+// Frames a tap injects. The remote sends five, but that redundancy buys margin
+// on a noisy RF link and injection is over a wire.
+//
+// UNVERIFIED: whether the MCU accepts a single frame has not been tested. Raise
+// this if it turns out to want more.
+static const uint8_t DEFAULT_TAP_FRAMES = 1;
+
+struct InjectPlan {
+  uint8_t frames;   // frames to put on the wire now; 0 = nothing to do
+  bool preamble;    // prefix them with the preamble -- the start of an injection
+  uint8_t key;
+  uint8_t counter;  // ours, and the same for every frame of this press
+
+  bool any() const { return this->frames != 0; }
+};
+
+class RelayGate {
+ public:
+  void set_decision_delay_ms(uint32_t ms) { this->decision_delay_ms_ = ms; }
+  uint32_t get_decision_delay_ms() const { return this->decision_delay_ms_; }
+  void set_tap_frames(uint8_t frames) { this->tap_frames_ = frames < 1 ? 1 : frames; }
+  uint8_t get_tap_frames() const { return this->tap_frames_; }
+  uint8_t get_counter() const { return this->counter_; }
+
+  // A press event. Arms the deadline and injects nothing at all. If a press is
+  // already pending -- two buttons inside one decision window -- that one
+  // resolves here as the tap it turned out to be, since a repeat of it can no
+  // longer arrive.
+  InjectPlan press(uint8_t key, uint32_t now_ms) {
+    const InjectPlan plan = this->resolve_pending_();
+    this->streaming_ = false;
+    this->pending_ = true;
+    this->pending_key_ = key;
+    this->pending_ms_ = now_ms;
+    return plan;
+  }
+
+  // A repeat event. The first one settles the pending press as a hold and opens
+  // the stream; each one after adds a frame to it. Carries no timestamp: a
+  // repeat is a fact about the button, and the only deadline here is the one
+  // poll() watches.
+  InjectPlan repeat(uint8_t key) {
+    if (this->pending_ && key == this->pending_key_) {
+      this->pending_ = false;
+      return this->open_stream_(key, 1);
+    }
+    // Also the recovery path when the sixth frame was lost and the deadline
+    // fired first: the tap that went out already carries this run's counter, so
+    // extending it here is indistinguishable on the wire from having called it
+    // a hold from the start.
+    if (this->streaming_ && key == this->stream_key_)
+      return InjectPlan{1, false, key, this->stream_counter_};
+    // A repeat with nothing behind it -- the press was not relayed, or a newer
+    // press has superseded this run.
+    return InjectPlan{0, false, key, 0};
+  }
+
+  // Called on every pass of the main loop. Fires the tap once the deadline
+  // passes with no repeat behind it.
+  InjectPlan poll(uint32_t now_ms) {
+    if (!this->pending_ || (uint32_t) (now_ms - this->pending_ms_) < this->decision_delay_ms_)
+      return InjectPlan{0, false, 0, 0};
+    this->pending_ = false;
+    return this->resolve_pending_tap_();
+  }
+
+  // A command originated on the ESP32 rather than relayed from the remote: one
+  // press, its own counter, no hold. It leaves any run in progress alone --
+  // interrupting a physical hold to squeeze this in would be worse than letting
+  // the two interleave.
+  InjectPlan originate(uint8_t key) {
+    return InjectPlan{this->tap_frames_, true, key, this->advance_counter_()};
+  }
+
+  void reset() {
+    this->pending_ = false;
+    this->streaming_ = false;
+  }
+
+ protected:
+  // Resolve a pending press as a tap, if there is one. Injecting leaves the
+  // stream open on the same counter so a late repeat can extend it.
+  InjectPlan resolve_pending_() {
+    if (!this->pending_)
+      return InjectPlan{0, false, 0, 0};
+    this->pending_ = false;
+    return this->resolve_pending_tap_();
+  }
+
+  InjectPlan resolve_pending_tap_() { return this->open_stream_(this->pending_key_, this->tap_frames_); }
+
+  InjectPlan open_stream_(uint8_t key, uint8_t frames) {
+    this->streaming_ = true;
+    this->stream_key_ = key;
+    this->stream_counter_ = this->advance_counter_();
+    return InjectPlan{frames, true, key, this->stream_counter_};
+  }
+
+  uint8_t advance_counter_() {
+    this->counter_ = (uint8_t) ((this->counter_ + 1) & 0x07);
+    return this->counter_;
+  }
+
+  uint32_t pending_ms_{0};
+  uint32_t decision_delay_ms_{DEFAULT_DECISION_DELAY_MS};
+  uint8_t tap_frames_{DEFAULT_TAP_FRAMES};
+  // Not restored across a reboot, deliberately. The ESP32 and the OEM MCU share
+  // the fan's secondary rail, so mains power cycles both and the MCU has no
+  // remembered counter either; the two can only disagree after an ESP32-only
+  // restart (OTA or a watchdog reset), and then at worst one injected command
+  // in eight is ignored and the button is pressed again. Persisting it would
+  // mean an NVS write per press to guard an inference.
+  uint8_t counter_{0};
+  uint8_t pending_key_{0};
+  uint8_t stream_key_{0};
+  uint8_t stream_counter_{0};
+  bool pending_{false};
+  bool streaming_{false};
 };
 
 }  // namespace fan_rf

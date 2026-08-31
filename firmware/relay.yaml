@@ -1,0 +1,167 @@
+# SmarterFan — milestone 1: RF relay
+#
+# Decodes the remote off the OEM receiver's output pad (GPIO6) and injects
+# reconstructed commands into the OEM MCU's RF input (GPIO5), so every button
+# still works while the ESP32 sits in the middle of the path.
+#
+# REQUIRES THE BOARD MODIFIED — the `102` between the RF receiver output and
+# the MCU input removed, and a level shifter on both lines. See README.md.
+# firmware/sniffer.yaml is the read-only build and needs no modification.
+#
+# Injecting on GPIO5 BEFORE the 102 is removed is not destructive: the ESP32
+# and the OEM receiver then both drive the MCU input through a 1 kOhm and the
+# two fight through 2 kOhm. It is also not a useful test, because whichever
+# source is asserting low wins and the MCU sees a mixture of the two.
+
+esphome:
+  name: smarterfan-relay
+  friendly_name: SmarterFan Relay
+
+esp32:
+  board: esp32-c3-devkitm-1
+  framework:
+    type: esp-idf
+
+logger:
+  level: DEBUG
+  # C3 has native USB-Serial-JTAG; this puts logs on the USB-C port.
+  hardware_uart: USB_SERIAL_JTAG
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  output_power: 8.5db
+  ap:
+    ssid: "SmarterFan Setup"
+    password: !secret ap_password
+
+captive_portal:
+
+improv_serial:
+
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [fan_rf]
+
+# --- receive: the OEM receiver's output pad --------------------------------
+# Identical to sniffer.yaml. Every value here was settled against real captures
+# and the reasoning is written up there; do not diverge without a reason.
+remote_receiver:
+  pin:
+    number: GPIO6
+  # Below the 136us shortest real symbol under worst-case AGC skew, and above
+  # the idle noise, which is what keeps captures press-correlated.
+  filter: 100us
+  # Deliberately below the 8.79ms inter-frame gap, so each of a burst's five
+  # repeats is its own capture and a held button never fills the buffer.
+  idle: 4ms
+  receive_symbols: 1024
+  buffer_size: 32768
+  tolerance: 40%
+
+# --- transmit: into the OEM MCU's RF input ---------------------------------
+remote_transmitter:
+  id: fan_tx
+  pin: GPIO5
+
+  # OOK at baseband. What arrives at the MCU is the demodulated two-level
+  # signal the OEM receiver would have produced, not a 433 MHz carrier, so
+  # there is nothing to modulate: 100% duty is the carrier switched off.
+  # fan_rf also sets carrier_frequency 0 on every call it makes.
+  carrier_duty_percent: 100%
+
+  # RMT memory for this channel, in 32-bit symbols. The C3 has 48 words per
+  # channel and this is the default; it is written out because the payload
+  # size depends on it.
+  #
+  # Each signed duration fan_rf emits becomes one 16-bit half-symbol, two to a
+  # word. The largest payload is the preamble plus one frame: 2 + 66 = 68
+  # halves = 34 words. The IDF's first encoding session fills the whole memory
+  # block, so at 48 the burst is staged in one pass and the transmission never
+  # depends on a refill interrupt landing on time. A bare frame during a hold
+  # is 33 words.
+  #
+  # `tap_frames` above 1 pushes past that — 5 frames is 166 words — and the
+  # driver then ping-pongs through half the block at a time. That works, but it
+  # puts symbol timing at the mercy of interrupt latency, so raise this to 96
+  # if you raise tap_frames, and drop remote_receiver's `rmt_symbols` to 48 to
+  # stay inside the C3's 192 words in total.
+  rmt_symbols: 48
+
+  # The RMT hands the line back after each frame instead of blocking loop() for
+  # the 41.4 ms the frame takes. A hold injects one frame per received repeat,
+  # and the next repeat is already being decoded while the current frame goes
+  # out — blocking here would stall that.
+  non_blocking: true
+
+fan_rf:
+  id: fan_remote
+  transmitter_id: fan_tx
+
+  press_frames: 5
+  run_timeout: 250ms
+  dump_frames: false
+  # Prints the injected frames as well as the decoded ones, which is the whole
+  # diagnostic for the relay until a scope is on the MCU's input pad:
+  #
+  #   [D][fan_rf]: press  key=18 (fan 2) counter=3  0xA1D8290D
+  #   [D][fan_rf]: inject key=18 (fan 2) counter=1  0xA1D82919  1x +preamble
+  dump_commands: true
+
+  # Everything is forwarded for now. `fan` drops the six light keys and keeps
+  # the rest, including the five whose side of the fan has never been verified
+  # — that is the setting for once the ESP32 drives the LEDs itself, which does
+  # not exist yet.
+  relay: all
+
+  # How long a press waits before it counts as a tap. Pure added latency on
+  # every tap, and it cannot go below press_frames x 41.1 ms = 205 ms, which is
+  # where the first repeat of a held button lands. See fan_rf/__init__.py.
+  relay_decision: 230ms
+
+  # Frames one tap injects. UNVERIFIED whether the MCU accepts a single frame:
+  # the remote sends five, but that redundancy is for a noisy RF link and this
+  # goes over a wire. Raise it if one turns out not to be enough — and raise
+  # remote_transmitter's rmt_symbols with it.
+  tap_frames: 1
+
+# Named buttons, for automations that should act on the remote rather than just
+# pass it through. Everything here is still relayed to the MCU as well.
+binary_sensor:
+  - platform: fan_rf
+    name: "Remote: brightness up"
+    key: bright_up
+
+  - platform: fan_rf
+    name: "Remote: brightness down"
+    key: bright_down
+
+  - platform: fan_rf
+    name: "Remote: light toggle"
+    key: light_toggle
+    repeats: false
+
+# Commands originated here rather than relayed. `key` takes any name from the
+# table in PROTOCOL.md section 4, or a raw 0-31 value, and can be templated.
+button:
+  - platform: template
+    name: "Fan: off"
+    on_press:
+      - fan_rf.send_key:
+          fan_rf_id: fan_remote
+          key: fan_off
+
+  - platform: template
+    name: "Fan: speed 1"
+    on_press:
+      - fan_rf.send_key: fan_1

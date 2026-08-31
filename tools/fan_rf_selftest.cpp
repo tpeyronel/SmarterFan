@@ -15,6 +15,13 @@
 // built from that document: the key table, the checksum, and the press/repeat
 // state machine, end to end through the same walk_frames() the firmware calls.
 //
+// The transmit path is checked the same way round. Its output is fed straight
+// back into the receive path, which is the validated one -- if walk_frames()
+// and decode_packet() pull the intended key and counter out of what the
+// builders emitted, the waveform is right. The literal durations are asserted
+// against PROTOCOL.md separately, because a round trip alone would pass on any
+// self-consistent pair of timings.
+//
 // The log modes remain because a real capture is still the only way to find out
 // what the receiver did on a given evening. They are diagnostics, not the test.
 
@@ -401,6 +408,323 @@ static void check_bursts() {
   }
 }
 
+// --- transmit path ----------------------------------------------------------
+
+// Everything the builders emit for one press: the preamble once, then `frames`
+// copies of the codeword, exactly as the relay stacks them into a transmit call.
+static std::vector<int32_t> build_burst(uint8_t key, uint8_t counter, int frames,
+                                        bool preamble = true) {
+  std::vector<int32_t> out;
+  int32_t buffer[FRAME_ENTRIES];
+  if (preamble) {
+    const size_t n = build_preamble(buffer, FRAME_ENTRIES);
+    out.insert(out.end(), buffer, buffer + n);
+  }
+  for (int f = 0; f < frames; f++) {
+    const size_t n = build_frame(key, counter, buffer, FRAME_ENTRIES);
+    out.insert(out.end(), buffer, buffer + n);
+  }
+  return out;
+}
+
+static void check_waveform() {
+  printf("-- transmit waveform --\n");
+
+  {  // The literal timings, against PROTOCOL.md section 1. A round trip cannot
+    // catch a wrong nominal -- the decoder's windows are 50% wide -- so these
+    // are asserted as numbers.
+    int32_t buffer[FRAME_ENTRIES];
+    checkf(build_preamble(buffer, FRAME_ENTRIES) == 2, "the preamble is 2 entries");
+    checkf(buffer[0] == 335, "preamble mark is 335us, got %d", buffer[0]);
+    checkf(buffer[1] == -7690, "preamble gap is 7690us, got %d", buffer[1]);
+
+    // bright+ at counter 0: 0xA1D8218F, so bit 31 is 1 and bit 30 is 0.
+    const size_t n = build_frame(KEY_BRIGHT_UP, 0, buffer, FRAME_ENTRIES);
+    checkf(n == 66, "one frame is 66 entries, got %zu", n);
+    checkf(buffer[0] == 756 && buffer[1] == -252, "a 1 bit is 756us mark + 252us space, got %d/%d",
+           buffer[0], buffer[1]);
+    checkf(buffer[2] == 252 && buffer[3] == -756, "a 0 bit is 252us mark + 756us space, got %d/%d",
+           buffer[2], buffer[3]);
+    checkf(buffer[64] == 330, "the stop mark is 330us, got %d", buffer[64]);
+    checkf(buffer[65] == -8787, "the inter-frame gap is 8787us, got %d", buffer[65]);
+
+    // Marks positive, spaces negative, alternating -- the convention
+    // decode_frame() reads and remote_transmitter writes.
+    bool alternates = true;
+    for (size_t i = 0; i < n; i++)
+      alternates = alternates && ((i % 2 == 0) ? buffer[i] > 0 : buffer[i] < 0);
+    check(alternates, "marks are positive and spaces negative, alternating");
+
+    // Every bit period is the nominal 1008us; only the split moves.
+    bool rigid = true;
+    for (size_t i = 0; i < PACKET_BITS * 2; i += 2)
+      rigid = rigid && (buffer[i] - buffer[i + 1]) == 1008;
+    check(rigid, "every bit period is 4 ticks, 1008us");
+
+    checkf(FRAME_PERIOD_US == 41373, "a frame plus its gap is 41373us, got %u",
+           (unsigned) FRAME_PERIOD_US);
+    checkf(build_preamble(buffer, 1) == 0, "build_preamble refuses a short buffer");
+    checkf(build_frame(KEY_BRIGHT_UP, 0, buffer, FRAME_ENTRIES - 1) == 0,
+           "build_frame refuses a short buffer");
+  }
+
+  {  // Round trip: emitted durations back through the receive path, which is
+    // the validated one, so it makes a good oracle for this direction.
+    for (size_t i = 0; i < KEY_COUNT; i++) {
+      for (uint8_t counter = 0; counter < 8; counter++) {
+        const std::vector<int32_t> burst = build_burst(KEY_TABLE[i].key, counter, 5);
+        int decoded = 0;
+        bool right = true;
+        walk_frames(burst.data(), burst.size(), [&](uint32_t bits) {
+          const Packet p = decode_packet(bits);
+          decoded++;
+          right = right && p.valid() && p.key == KEY_TABLE[i].key && p.counter == counter;
+        });
+        checkf(decoded == 5 && right, "%s at counter %u: 5 frames out, all decoding back",
+               KEY_TABLE[i].name, counter);
+      }
+      // And against the captured codeword itself, not just against the encoder.
+      const std::vector<int32_t> burst = build_burst(KEY_TABLE[i].key, 0, 1);
+      uint32_t word = 0;
+      walk_frames(burst.data(), burst.size(), [&](uint32_t bits) { word = bits; });
+      checkf(word == KEY_TABLE[i].cnt0_frame, "%s emits 0x%08X, PROTOCOL.md says 0x%08X",
+             KEY_TABLE[i].name, word, KEY_TABLE[i].cnt0_frame);
+    }
+  }
+
+  {  // The preamble must not be mistaken for a frame, and must not swallow one.
+    const std::vector<int32_t> burst = build_burst(KEY_FAN_3, 5, 1);
+    FrameWalk walk{};
+    PressTracker t;
+    const std::vector<uint32_t> events = run_capture(t, burst, 1000, nullptr, &walk);
+    // Three chunks: the preamble, the frame, and the empty tail behind the
+    // trailing gap. Only the frame is 32 clean bits.
+    checkf(walk.chunks == 3, "preamble + frame splits into 3 chunks, got %u",
+           (unsigned) walk.chunks);
+    checkf(walk.decoded == 1, "and exactly one of them decodes, got %u", (unsigned) walk.decoded);
+    checkf(events.size() == 1, "and it reports one press, got %zu", events.size());
+  }
+
+  {  // A hold is injected as separate calls: preamble + frame, then bare frames.
+    // Concatenated they have to read as one continuous stream of frames.
+    std::vector<int32_t> stream = build_burst(KEY_TEMP_DOWN, 2, 1);
+    for (int i = 0; i < 6; i++) {
+      const std::vector<int32_t> more = build_burst(KEY_TEMP_DOWN, 2, 1, false);
+      stream.insert(stream.end(), more.begin(), more.end());
+    }
+    const FrameWalk walk = walk_frames(stream.data(), stream.size(), [](uint32_t) {});
+    checkf(walk.decoded == 7, "an injected hold of 7 frames decodes as 7, got %u",
+           (unsigned) walk.decoded);
+  }
+}
+
+// --- the relay decision -----------------------------------------------------
+//
+// Driven by synthesised event streams rather than by pulses: the gate sits
+// above the frame layer and only ever sees presses, repeats and the clock.
+
+// Everything the gate put on the wire, one entry per injected frame.
+struct Injected {
+  uint8_t key;
+  uint8_t counter;
+  bool preamble;  // true on the frame that carried the burst's preamble
+};
+
+static void collect(std::vector<Injected> &out, const InjectPlan &plan) {
+  for (uint8_t f = 0; f < plan.frames; f++)
+    out.push_back(Injected{plan.key, plan.counter, plan.preamble && f == 0});
+}
+
+static void check_relay_gate() {
+  printf("-- relay decision --\n");
+  const uint32_t period = 41;  // ms between received frames
+  const uint8_t key = KEY_FAN_2;
+
+  {  // A tap: a press, then silence. Nothing goes out until the deadline, and
+    // then exactly one frame.
+    RelayGate gate;
+    std::vector<Injected> sent;
+    collect(sent, gate.press(key, 0));
+    checkf(sent.empty(), "nothing is injected on the press event (sent %zu)", sent.size());
+    for (uint32_t now = 0; now < gate.get_decision_delay_ms(); now += 10) {
+      collect(sent, gate.poll(now));
+      checkf(sent.empty(), "still nothing at %u ms, before the deadline", (unsigned) now);
+    }
+    collect(sent, gate.poll(gate.get_decision_delay_ms()));
+    checkf(sent.size() == 1, "the deadline injects exactly one frame (sent %zu)", sent.size());
+    check(!sent.empty() && sent[0].preamble, "and it carries the preamble");
+    check(!sent.empty() && sent[0].key == key, "and the key that was pressed");
+
+    // The deadline fires once, not on every subsequent poll.
+    collect(sent, gate.poll(gate.get_decision_delay_ms() + 1000));
+    checkf(sent.size() == 1, "and does not fire again (sent %zu)", sent.size());
+  }
+
+  {  // A hold of N repeats injects N frames, starting at the first repeat --
+    // which arrives well before the deadline would have.
+    const int repeats = 12;
+    RelayGate gate;
+    std::vector<Injected> sent;
+    uint32_t now = 0;
+    collect(sent, gate.press(key, now));
+    for (int r = 1; r <= repeats; r++) {
+      now += period;
+      collect(sent, gate.poll(now));
+      collect(sent, gate.repeat(key));
+    }
+    checkf((int) sent.size() == repeats, "a hold of %d repeats injects %d frames (sent %zu)",
+           repeats, repeats, sent.size());
+    check(!sent.empty() && sent[0].preamble, "the first injected frame carries the preamble");
+    bool once = true;
+    for (size_t i = 1; i < sent.size(); i++)
+      once = once && !sent[i].preamble;
+    check(once, "and no later frame repeats it");
+
+    // Every frame of the hold is the same press: one counter throughout.
+    bool same = true;
+    for (const Injected &frame : sent)
+      same = same && frame.counter == sent[0].counter && frame.key == key;
+    check(same, "every frame of a hold carries one key and one counter");
+  }
+
+  {  // The hold stops when the button is released: no repeats, no frames, and
+    // the deadline has long since been resolved.
+    RelayGate gate;
+    std::vector<Injected> sent;
+    collect(sent, gate.press(key, 0));
+    collect(sent, gate.repeat(key));
+    const size_t during = sent.size();
+    for (uint32_t now = 2 * period; now < 5000; now += period)
+      collect(sent, gate.poll(now));
+    checkf(sent.size() == during, "a released hold injects nothing further (sent %zu more)",
+           sent.size() - during);
+  }
+
+  {  // Consecutive presses must differ, or the MCU cannot tell them apart.
+    RelayGate gate;
+    std::vector<Injected> sent;
+    uint32_t now = 0;
+    for (int press = 0; press < 16; press++) {
+      collect(sent, gate.press(key, now));
+      now += gate.get_decision_delay_ms() + 1;
+      collect(sent, gate.poll(now));
+      now += 1000;
+    }
+    checkf(sent.size() == 16, "16 taps inject 16 frames (sent %zu)", sent.size());
+    bool differ = true;
+    for (size_t i = 1; i < sent.size(); i++)
+      differ = differ && sent[i].counter != sent[i - 1].counter;
+    check(differ, "consecutive presses carry different counters");
+    // 3 bits, so it has to wrap rather than saturate.
+    bool wrapped = false;
+    for (const Injected &frame : sent)
+      wrapped = wrapped || frame.counter < sent[0].counter;
+    check(wrapped, "and the counter wraps at 8 rather than sticking");
+  }
+
+  {  // A press whose sixth frame was lost: the deadline fires and calls it a
+    // tap, then the seventh frame arrives. The stream has to pick up, because
+    // the tap already carried this run's counter.
+    RelayGate gate;
+    std::vector<Injected> sent;
+    collect(sent, gate.press(key, 0));
+    collect(sent, gate.poll(gate.get_decision_delay_ms()));
+    checkf(sent.size() == 1, "the deadline injected the tap (sent %zu)", sent.size());
+    collect(sent, gate.repeat(key));
+    collect(sent, gate.repeat(key));
+    checkf(sent.size() == 3, "and the late repeats extend it (sent %zu)", sent.size());
+    bool same = true;
+    for (const Injected &frame : sent)
+      same = same && frame.counter == sent[0].counter;
+    check(same, "on the counter the tap already used, so the MCU sees one press");
+  }
+
+  {  // Two buttons inside one decision window. The first resolves as the tap it
+    // was; a repeat of it can no longer arrive.
+    RelayGate gate;
+    std::vector<Injected> sent;
+    collect(sent, gate.press(KEY_FAN_1, 0));
+    collect(sent, gate.press(KEY_FAN_OFF, 50));
+    checkf(sent.size() == 1 && sent[0].key == KEY_FAN_1,
+           "a second press flushes the first as a tap (sent %zu)", sent.size());
+    collect(sent, gate.poll(50 + gate.get_decision_delay_ms()));
+    checkf(sent.size() == 2 && sent[1].key == KEY_FAN_OFF, "and the second follows on its own deadline");
+    checkf(sent[0].counter != sent[1].counter, "with distinct counters");
+    // A stale repeat of the superseded run must not reopen it.
+    const size_t before = sent.size();
+    collect(sent, gate.repeat(KEY_FAN_1));
+    checkf(sent.size() == before, "a repeat of the superseded press injects nothing");
+  }
+
+  {  // tap_frames is the knob for "one frame may not be enough". Every frame of
+    // the tap is still one press.
+    RelayGate gate;
+    gate.set_tap_frames(5);
+    std::vector<Injected> sent;
+    collect(sent, gate.press(key, 0));
+    collect(sent, gate.poll(gate.get_decision_delay_ms()));
+    checkf(sent.size() == 5, "tap_frames=5 injects 5 frames (sent %zu)", sent.size());
+    bool same = true;
+    for (const Injected &frame : sent)
+      same = same && frame.counter == sent[0].counter;
+    check(same, "all on one counter");
+    checkf(sent[0].preamble && !sent[1].preamble, "with the preamble once, at the front");
+  }
+
+  {  // send_key: one press, its own counter, and it does not disturb a relay
+    // decision already in flight.
+    RelayGate gate;
+    std::vector<Injected> sent;
+    collect(sent, gate.press(key, 0));
+    collect(sent, gate.originate(KEY_LIGHT_TOGGLE));
+    checkf(sent.size() == 1 && sent[0].key == KEY_LIGHT_TOGGLE,
+           "send_key injects one frame immediately (sent %zu)", sent.size());
+    check(sent[0].preamble, "with a preamble of its own");
+    collect(sent, gate.poll(gate.get_decision_delay_ms()));
+    checkf(sent.size() == 2 && sent[1].key == key, "and the pending press still resolves");
+    checkf(sent[0].counter != sent[1].counter, "on a different counter");
+  }
+}
+
+static void check_key_domains() {
+  printf("-- fan / light classification --\n");
+
+  // Transcribed from the button names in PROTOCOL.md section 4. The five marked
+  // UNVERIFIED could act on the fan, the light or both; nobody has watched.
+  struct DomainRow {
+    uint8_t key;
+    KeyDomain domain;
+  };
+  static const DomainRow ROWS[] = {
+      {KEY_BRIGHT_UP, DOMAIN_LIGHT},          {KEY_BRIGHT_DOWN, DOMAIN_LIGHT},
+      {KEY_TEMP_UP, DOMAIN_LIGHT},            {KEY_TEMP_DOWN, DOMAIN_LIGHT},
+      {KEY_LIGHT_TOGGLE, DOMAIN_LIGHT},       {KEY_CYCLE_FULL_BRIGHT, DOMAIN_LIGHT},
+      {KEY_FAN_1, DOMAIN_FAN},                {KEY_FAN_2, DOMAIN_FAN},
+      {KEY_FAN_3, DOMAIN_FAN},                {KEY_FAN_4, DOMAIN_FAN},
+      {KEY_FAN_5, DOMAIN_FAN},                {KEY_FAN_6, DOMAIN_FAN},
+      {KEY_FAN_OFF, DOMAIN_FAN},              {KEY_FAN_FORWARD, DOMAIN_FAN},
+      {KEY_FAN_REVERSE, DOMAIN_FAN},          {KEY_ALL_OFF, DOMAIN_UNVERIFIED},
+      {KEY_NIGHT_MODE, DOMAIN_UNVERIFIED},    {KEY_NATURAL_WIND, DOMAIN_UNVERIFIED},
+      {KEY_TIMER_2H, DOMAIN_UNVERIFIED},      {KEY_TIMER_4H, DOMAIN_UNVERIFIED},
+  };
+  const size_t rows = sizeof(ROWS) / sizeof(ROWS[0]);
+  checkf(rows == KEY_COUNT, "every button is classified (%zu of %zu)", rows, KEY_COUNT);
+
+  for (size_t i = 0; i < rows; i++) {
+    checkf(key_domain(ROWS[i].key) == ROWS[i].domain, "%s is classified as expected",
+           key_name(ROWS[i].key));
+    check(relay_key(RELAY_ALL, ROWS[i].key), "relay: all forwards everything");
+    check(!relay_key(RELAY_NONE, ROWS[i].key), "relay: none forwards nothing");
+    // Fan mode drops the light keys and keeps the unverified ones: dropping a
+    // button whose effect is unknown would break something that works.
+    checkf(relay_key(RELAY_FAN, ROWS[i].key) == (ROWS[i].domain != DOMAIN_LIGHT),
+           "relay: fan handles %s correctly", key_name(ROWS[i].key));
+  }
+
+  // A key this remote does not have is unverified, never silently a fan key.
+  check(key_domain(0) == DOMAIN_UNVERIFIED, "an unlisted key is unverified");
+}
+
 // --- log replay (diagnostic) ------------------------------------------------
 
 struct Capture {
@@ -582,6 +906,9 @@ int main(int argc, char **argv) {
   check_validation();
   check_press_tracker();
   check_bursts();
+  check_waveform();
+  check_relay_gate();
+  check_key_domains();
   printf("\n%d checks, %d failures\n", checks, failures);
 
   if (!paths.empty() && failures == 0)
