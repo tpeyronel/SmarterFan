@@ -1,6 +1,74 @@
 # SmarterFan RF Remote Protocol
 
-## 1. Frame layout
+## 1. Wire format
+
+Plain OOK at 433.92 MHz. The OEM receiver demodulates, so what appears at its
+output pad is a baseband two-level signal. Bits are PWM-coded on a single tick:
+
+```
+tick   = 252 us
+bit 0  = 1 tick mark + 3 tick space   (252 / 756 us)
+bit 1  = 3 tick mark + 1 tick space   (756 / 252 us)
+period = 4 ticks = 1008 us
+```
+
+Measured over 10592 symbols the bit period is **1009.1 µs, sd 3.3 µs**. That is a
+crystal. The period is rigid; only the *split* between mark and space moves.
+
+### Burst structure
+
+One press transmits:
+
+```
+[335 µs mark][7.69 ms gap]                            preamble, once
+5 × [32 data bits][~330 µs stop mark][8.79 ms gap]    the frame, repeated
+```
+
+The inter-frame gap is 8787 µs ± 10 µs over 120 measurements. Total airtime for
+one press is ≈ 215 ms, and a held button emits one frame every 41.1 ms.
+
+The longest space *inside* a decodable frame is 865 µs, so any split threshold
+between roughly 1 ms and the 7.69 ms preamble gap separates a burst into frames
+cleanly. `fan_rf` splits at 5 ms.
+
+### AGC skew
+
+The receiver's AGC is at full gain when a burst arrives and takes about two
+frames to settle. While it settles it stretches marks and eats spaces:
+
+|                   | frame 1 | frame 2 | frame 3 | frame 5 |
+|-------------------|---------|---------|---------|---------|
+| short mark, mean  | 303 µs  | 278 µs  | 270 µs  | 266 µs  |
+| short space, mean | 209 µs  | 231 µs  | 240 µs  | 244 µs  |
+| short space, min  | 136 µs  | 175 µs  | 208 µs  | 216 µs  |
+
+The bias is common-mode — `mark − space` runs +89 µs in frame 1 against +22 µs in
+frame 5, on both the short and the long pair — so it cancels in `mark + space`
+and leaves the period untouched. De-biased, every frame position recovers
+255/754 µs.
+
+Three consequences for a receiver:
+
+* **Match the period, not the widths.** Matching each pulse loosely (252/756 µs
+  at 50%, a sanity rail) and the bit period tightly (1009 µs at 5%, about 15 σ)
+  decodes frame 1. Four absolute width windows cannot: the short space alone
+  spans 136–312 µs, a 39% spread that no choice of nominal covers at a sane
+  tolerance.
+* **Decode every frame independently.** Frame 1 is the corrupted one. A decoder
+  that only attempts a decode from the start of a capture throws away four good
+  frames behind one bad one.
+* **Any glitch filter must sit below 136 µs**, the shortest real symbol under
+  worst-case skew. At 200 µs the AGC-compressed early spaces fall under the
+  threshold and are merged away, destroying frame 1 outright.
+
+### Idle noise
+
+With no transmitter present the AGC ramps to full gain and the pad carries
+amplified band noise continuously — the line is not idle between presses.
+Validate on pulse timing and on the frame fields below; never on edge counting.
+Real symbols are quantised to the tick, noise is not.
+
+## 2. Frame layout
 
 32 bits, MSB first, exactly as printed by the dumper:
 
@@ -33,7 +101,7 @@ device-type field folded in. A single-remote capture cannot split "remote ID" fr
 
 ### KEY — 5 bits, the button
 
-One value per physical button, from the fixed table in §3.
+One value per physical button, from the fixed table in §4.
 
 ### CNT — 3 bits, press counter
 
@@ -74,7 +142,7 @@ char23 ^ char27 ^ char31 = 0      (nibble bit 0, 0x6 bit 0 = 0)
 Receive-side validation: `(n5 ^ n6 ^ n7) == 0x6`, where `n5..n7` are the last three
 nibbles of the word.
 
-## 2. Transmission behaviour
+## 3. Transmission behaviour
 
 * Each press sends the same frame **exactly 5 times**. A burst that decodes as fewer than 5 frames means the decoder lost
   some to noise, not that the remote sent fewer.
@@ -86,7 +154,7 @@ nibbles of the word.
 * No rolling code, no encryption, no per-frame nonce. The only state is the 3-bit
   counter.
 
-## 3. Key table
+## 4. Key table
 
 `CNT=0 frame` is the full 32-bit word for that button with the counter at zero; the
 other seven words for the same button follow from `CNT` and the checksum.

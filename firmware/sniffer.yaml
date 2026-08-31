@@ -157,11 +157,10 @@ remote_receiver:
   # Put the scope's trigger point at the far RIGHT of the screen and use
   # ~250 ms of pre-trigger to see the burst that caused it.
 
-  # `filter_symbols: 120` would drop the garbage bursts (max 95 symbols) while
-  # passing real packets (166) — but leave it OFF while the cold-press fault
-  # is still open. That garbage is the only evidence we have of what the
-  # receiver does during a failed press, and the log is not actually flooded:
-  # a whole session is ~15 captures. See README, "Cold-press failure".
+  # `filter_symbols: 120` drops the garbage bursts (max 95 symbols) while
+  # passing real packets (166). Left OFF here because the log is not actually
+  # flooded — a whole session is ~15 captures — and the garbage is worth seeing
+  # while the receive path is still being characterised. See README, "Tooling".
 
   # One rmt_receive() call holds `receive_symbols` symbols; it completes on
   # `idle` OR when that buffer fills, and the driver then re-arms. Anything

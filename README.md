@@ -147,11 +147,11 @@ flowchart TB
 | Item | Notes |
 |---|---|
 | **NodeMCU ESP32-C3 SuperMini** | The chosen board. Requires the antenna mod — see [antenna](#antenna). |
-| BSS138 4-channel level shifter module | The ubiquitous $1 bidirectional I²C shifter. Used for the inject line. It also works on the sniff line, though it lifts the pad's low level from 0 V to 0.8 V — see [Tap options](#tap-options). |
+| BSS138 4-channel level shifter module | The ubiquitous $1 bidirectional I²C shifter. Used for the inject line. It also works on the sniff line, though it lifts the pad's low level from 0 V to 0.8 V. |
 | Buck converter, **≥60 V input** → 5 V | ⚠️ MP1584 modules are 28 V max and are **not** suitable. |
 | 2× 620 Ω resistor | Optocoupler drive |
 | 1× 1 kΩ resistor | Series protection on the RF inject line |
-| 1× `CD4050B` hex buffer *(optional)* | RF sniff line. Better than either a divider or the BSS138 on principle — push-pull output, CMOS input that does not load the pad — but this is a prediction, not a measured improvement. A correctly sized divider works. See [Tap options](#tap-options). |
+| 1× `CD4050B` hex buffer *(optional)* | RF sniff line. Better than either a divider or the BSS138 on principle — push-pull output, CMOS input that does not load the pad — but this is a prediction, not a measured improvement. A correctly sized divider works, and at these timings source impedance is irrelevant: a 10k/22k divider against 50 pF of stray is a 0.76 µs edge, 0.6% of the shortest symbol. |
 | 1× 220–470 µF, **105 °C or polymer** | Bulk on 3V3. Standard 85 °C parts dry out in a hot canopy. |
 | 1× 100 nF ceramic | HF decoupling, mounted at the module pins |
 | Header sockets | Socket the ESP32 — don't solder it down |
@@ -198,7 +198,7 @@ Oscilloscope (not optional — you cannot do the RF work without one), multimete
 | Signal | GPIO | Direction | Connects to |
 |---|---|---|---|
 | RF inject | **5** | out — RMT TX | shifter `LV1` → `HV1` → 1 kΩ → MCU RF input pad |
-| RF sniff | **6** | in — RMT RX | Receiver output pad via a 10k/22k divider (3.08 V), or a `CD4050B` buffer. Size any divider so the high clears V<sub>IH</sub> = 2.475 V: 10k/10k gives 2.24 V and is below spec. See [Tap options](#tap-options) |
+| RF sniff | **6** | in — RMT RX | Receiver output pad via a 10k/22k divider (3.08 V), or a `CD4050B` buffer. Size any divider so the high clears V<sub>IH</sub> = 2.475 V: 10k/10k gives 2.24 V and is below spec |
 | LED channel A dim | **7** | out — LEDC | 620 Ω → opto-side pad of `R37` |
 | LED channel B dim | **10** | out — LEDC | 620 Ω → opto-side pad of `R38` |
 | Supply in | `5V` | — | buck output |
@@ -249,158 +249,49 @@ Take power from the low-voltage DC bus (the one behind D6 with the 470 µF caps)
 
 ## Remote protocol
 
-Decoded from two capture sessions off the OEM receiver's output (`firmware/sniffer.yaml`, `dump: raw`). Decoder: `tools/decode_fan_rf.py`.
+**Solved. [PROTOCOL.md](PROTOCOL.md) is the reference** — wire format and symbol
+timings, burst structure, the 32-bit frame (20-bit prefix, 5-bit key, 3-bit press
+counter, 4-bit checksum), and the key table for all 20 buttons on the remote.
 
-### Wire format
+Three properties of it shape the rest of this project:
 
-Plain OOK, no carrier at baseband — the receiver has already demodulated. Two pulse widths, PWM-coded:
+- **No rolling code.** The only state is a 3-bit press counter that advances once
+  per physical press. Replay works: a captured frame is accepted whenever its
+  counter differs from the last one the MCU saw. Synthesising an arbitrary
+  command is a table lookup and a 4-bit XOR.
+- **The AGC corrupts the first frame of every burst.** A decoder has to split the
+  capture and try all five repeats; one that only decodes from the start of a
+  capture — ESPHome's stock `rc_switch`, for one — loses the whole press. This is
+  why `fan_rf` exists.
+- **The line is never idle.** With nothing transmitting the receiver's AGC output
+  is amplified band noise, so validation must be on pulse timing and frame
+  fields, not on edge counting.
 
-| Symbol | Mark | Space | Period |
-|---|---|---|---|
-| bit `0` | 288 µs | 704 µs | 1009 µs |
-| bit `1` | 800 µs | 224 µs | 1009 µs |
+---
 
-Those are the profile nominals. Real symbols wander a long way from them while the receiver's AGC settles — see [AGC skew](#agc-skew).
+## Tooling
 
-One press transmits:
+Receive-side only, and none of it needs the board modified — just the sniff tap.
+`firmware/sniffer.yaml` is the ESPHome build, and it loads three local
+components:
 
-```
-[335 µs mark][7.69 ms gap]              preamble, once
-then 5 ×  [32 data bits][~330 µs stop mark][8.79 ms gap]
-```
+| Component | Does |
+|---|---|
+| `firmware/components/fan_rf` | The decoder. Splits a capture on gaps over 5 ms, decodes each frame independently as 32 PWM bits, majority-votes the survivors, validates the prefix and the checksum, and deduplicates on the press counter so one press produces one event. |
+| `firmware/components/fan_rf_dump` | Prints every frame that decodes as a 32-bit binary word and nothing else — no field checks, no vote, no dedupe. All-or-nothing per frame, so a corrupt frame prints nothing rather than a half-guessed word. Standalone: needs `remote_receiver` and nothing else. |
+| `firmware/components/adc_logger` | Streams an ADC pin's samples to the log continuously — no trigger, no thresholding — for looking at the pad as an analogue waveform. Wiring is `pad --[10k]-- GPIO3 --[10k]-- GND`; 10 kSa/s fits in the log's throughput. |
 
-All five repeats carry an identical payload. Total airtime ≈ 215 ms. Gap timings are tight: 8787 µs ± 10 µs across 120 measurements.
+The protocol itself lives in `fan_rf/fan_rf_protocol.h`, which has no ESPHome,
+Arduino or IDF dependency, so it compiles on the host.
 
-### Packet layout
+> ⚠️ `fan_rf` still models the frame as a 16-bit device ID plus an 8-bit command,
+> which predates the full key table. That command byte drops the low bit of
+> `KEY`, so it cannot separate the two buttons in each pair — `0x23` is both
+> *temp +* and *all off*. It validates and deduplicates correctly; it identifies
+> buttons wrongly. Port it to the `KEY`/`CNT` split in PROTOCOL.md before
+> trusting a named button.
 
-32 bits, MSB first:
-
-| Bits | Field | Value |
-|---|---|---|
-| 0–15 | Device / remote ID | `0xA1D8` in every packet seen |
-| 16–23 | Command | `0x21` brightness +, `0x23` colour temp +, `0x28` fan speed 1 |
-| 24–27 | High nibble | `[domain flag][3-bit press counter]` |
-| 28–31 | Low nibble | `high nibble XOR (command & 0x0F) XOR 6` |
-
-The press counter advances +1 mod 8 on **every** press of any button, and is identical across the five repeats of one press. The domain flag is `1` for the light commands and `0` for the fan command — the inverse of command bit 3, consistent with the command space splitting `0x20`–`0x27` light / `0x28`–`0x2F` fan.
-
-Example — brightness + with counter 6: `A1 D8 21 E9`.
-
-Bit 28 reads as a constant `1` in every packet captured so far, but it is not a marker: `flag XOR (command bit 3)` is `1` by construction, so the nibble rule produces it for free. An earlier revision of this document called bits 24 and 28 markers; capturing a fan button disproved that for bit 24. The nibble rule holds on all 24 distinct codewords across three sessions.
-
-**The counter is a sequence number, not a rolling security code.** It advances once per physical press and is identical across the five repeats, which is exactly what a receiver needs to tell a new press from a retransmission. It carries no state and no cryptography, so replay works: a captured packet is accepted whenever its counter differs from the last one the MCU saw.
-
-**Caveats.** Three buttons across a 6-button-plus remote. The `XOR 6` constant survived the addition of a third command, which is meaningful evidence, but the domain flag and command bit 3 have been perfectly correlated in every packet so far — a light command with bit 3 set, or a fan command with it clear, would separate the two readings. Capture the remaining buttons before *synthesising* commands that have never been observed.
-
-### AGC skew
-
-The receiver does not merely settle in amplitude; it skews the duty cycle. Over the first frame of a transmission marks stretch and short spaces compress, converging by roughly frame 3:
-
-| | frame 1 | frame 2 | frame 3 | frame 5 |
-|---|---|---|---|---|
-| short mark, mean | 303 µs | 278 µs | 270 µs | 266 µs |
-| short space, mean | 209 µs | 231 µs | 240 µs | 244 µs |
-| short space, min | 136 µs | 175 µs | 208 µs | 216 µs |
-
-This drives two configuration constraints, and getting either wrong silently costs most of your decodes:
-
-- **`filter` must sit well below the short symbol.** At `200us` the compressed early spaces fall under the threshold and are merged away, destroying frame 1 entirely.
-- **`tolerance` must be at least ~40%** *for a width-only matcher.* Across both clean sessions the short space spans 136–312 µs, an inherent 39% spread that no choice of nominal covers at 25%. That spread is real, but it is not inherent to the signal — it is inherent to comparing four absolute windows. It is the mark/space *split* that moves; the bit period holds to 3.3 µs. See [What the symbol timings actually are](#what-the-symbol-timings-actually-are).
-
-Frame 1 matters more than its 1-in-5 share suggests, because ESPHome's `rc_switch` decoder only ever starts at the beginning of a capture — it does not rescan. If frame 1 is unreadable the whole press is lost, even though frames 2–5 are perfect. That single fact accounted for a drop from 37/37 presses decoded to 5/37.
-
-### Cold-press failure — what a full audit of every capture shows
-
-Re-parsing every log with correct capture reassembly (the raw dumper flushes at a 256-char line buffer and continues on further lines; counting one line is not counting one capture) gives this:
-
-| log | `filter` | tap | frames | clean | frame 1 clean |
-|---|---|---|---|---|---|
-| log2 | 200 µs | BSS138 | 150 | 118 | **0/30** |
-| log3 | 100 µs | BSS138 | 184 | **184** | **37/37** |
-| log4 | 100 µs | BSS138 | 14 | 10 | 2/5 |
-| log5 | **20 µs** | BSS138 | 2 | **0** | 0/5 |
-| log6 | **20 µs** | 10k/22k divider | 6 | **0** | 0/3 |
-| log7 | **20 µs** | 10k/22k divider | 5 | **0** | 0/7 |
-| log14 | 100 µs | 10k/22k divider | 47 | 4 | 0/11 |
-| log15 | 100 µs | 10k/22k divider | 57 | 3 | 0/26 |
-| log16 | 100 µs | 10k/10k divider | 103 | 11 | 1/23 |
-
-Three separate conclusions fall out.
-
-**`filter` has one demonstrated failure mode, and it is at the high end.** At 200 µs the pulse-width distribution is *truncated exactly at the threshold* — a hard pile-up at 200 µs with nothing below it — and 0 of 30 captures in log2 had a decodable frame 1. That is a mechanistic signature, not a correlation: the AGC-compressed short spaces fall under the threshold and are merged away.
-
-The rule that follows is simply to keep `filter` below the shortest real symbol, which is 136 µs in the worst AGC-skewed case. 100 µs satisfies that with margin.
-
-**An earlier revision of this document claimed `filter: 20us` "destroys the signal" on the basis that logs 5, 6 and 7 contain zero decodable frames. That claim was wrong** and is recorded here because the way it was wrong is instructive. Those three logs hold **13 frames between them**, and all three are cold-press sessions. At the cold-press clean rate measured elsewhere (18/207 = 8.7%), the expected count is 1.1 and the probability of observing zero is 31% — an unremarkable outcome. Applying a 100 µs glitch filter to those same captures in software, which should recover the frames if filtering were the mechanism, recovers none. There is no evidence 20 µs is harmful.
-
-**A tap comparison that looks decisive and is not.** log3 (BSS138) decodes 184 of 184 frames; logs 14–16 (dividers) manage 4–18%. That reads as a verdict on the tap. It is not one, for two independent reasons.
-
-First, **log3 is the only warm-press session and every divider session is cold**, so tap and press-style are perfectly confounded — there is no divider+warm capture anywhere in the data to separate them.
-
-Second, and decisively, **a correctly sized divider cannot affect this protocol at all.** A 10k/22k divider is a 6.9 kΩ source. Against a realistic 50 pF of pin and stray capacitance that is a 0.76 µs edge, or 0.56% of the 136 µs shortest symbol. Consuming even 20% of a symbol would require ~1.8 nF — 36× more capacitance than a short lead to a CMOS pin carries. Noise fails the same test: flipping a 3.08 V level through 6.9 kΩ needs ~145 µA of injected current, far beyond capacitive coupling at these frequencies. The timings here are simply far too slow for source impedance to matter.
-
-One real defect is specific and separate: the 10k/10k divider used in log16 puts 2.24 V on the pin against a V<sub>IH</sub> of 2.475 V — below spec. That is a sizing error, not an argument about dividers, and it applies to log16 alone.
-
-The remaining variation between logs is warm versus cold, which is [AGC skew](#agc-skew) and nothing to do with the tap. Note also that the BSS138 is not a buffer: its LV side rises through a 10 kΩ pull-up and it only pulls *down* actively, so it shares the divider's source impedance while additionally lifting the pad's low from 0 V to 0.8 V. There was never a mechanism by which it should outperform a divider.
-
-**What remains is a decoder limitation, not a signal problem.** ESPHome's `rc_switch` only ever attempts a decode from offset 0 of a capture — it never rescans. Frame 1 is the AGC-corrupted one. In log4, cold presses through the BSS138 gave frame 1 at 40% but frames 3–5 at **100%**: the packet was sitting in the capture, intact, in a place the decoder never looks.
-
-So the original "cold-press failure" was never RF, never the AGC destroying the transmission, never amplitude or threshold or hysteresis. The transmission arrives, frames 2–5 are clean, and the on-device decoder gives up after the one frame that is not.
-
-### Clean-frame rate by position in the burst
-
-| log | f1 | f2 | f3 | f4 | f5 |
-|---|---|---|---|---|---|
-| log3 (warm, BSS138) | 100% | 100% | 100% | 100% | 100% |
-| log4 (cold, BSS138) | 40% | 66% | **100%** | **100%** | **100%** |
-| log16 (cold, divider) | 7% | 7% | 16% | 16% | 18% |
-
-The AGC settles across a burst, exactly as [AGC skew](#agc-skew) describes — but only the BSS138 rows ever reach a usable state, and only past frame 1.
-
-### What the symbol timings actually are
-
-The remote uses the standard single-tick 1:3 PWM encoding:
-
-    tick   = 252 us
-    bit 0  = 1 tick mark + 3 tick space
-    bit 1  = 3 tick mark + 1 tick space
-    period = 4 ticks = 1008 us
-
-Measured over 10592 symbols the bit period is **1009.1 µs with a standard deviation of 3.3 µs**. That is a crystal. The protocol is rigid; only the *split* between mark and space moves.
-
-It moves because the receiver stretches marks and eats spaces by the same amount — +17/−16 µs on average, +89 µs in frame 1 while the AGC settles. The bias is common-mode, so it cancels in `mark + space` and leaves the period untouched. De-bias the measured symbols and you recover 255/754 in every frame position.
-
-| | frame 1 (settling) | frame 5 (settled) |
-|---|---|---|
-| mark − space, short pair | +89 µs | +22 µs |
-| mark − space, long pair | +90 µs | +22 µs |
-| de-biased short / long | 256 / 753 | 255 / 754 |
-
-So the decoders match each **pulse** loosely (252/756 µs at 50%, a sanity rail) and the **period** tightly (1009 µs at 5%, about 15 σ). Against the noise captures that accepts 2.2% of symbol pairs where width windows alone accept 7.3%, while decoding 331 frames instead of 327.
-
-An earlier revision used 288/800/224/704 at 40%. Those were never measurements — they are 9/25/7/22 × 32, the grid forced by the deleted `rc_switch` profile's `pulse_length: 32`, and they sat *further* from the measured centres (23.5 µs average error) than 252/756 does (16.5 µs). Their 313.6 µs short-space ceiling was clipping real data.
-
-### The on-device decoder
-
-`firmware/components/fan_rf` is the answer to the paragraph above. It is an ESPHome external component that registers as a `remote_receiver` listener and, for every capture:
-
-1. splits it on gaps longer than 5 ms, which is where the 8.79 ms inter-frame gap sits and no in-frame space comes close;
-2. decodes **each frame independently** as 32 PWM bits — each pulse matched loosely (252/756 µs, 50%) and the bit period matched tightly (1009 µs, 5%);
-3. majority-votes across whichever frames survived, rather than trusting any one of them;
-4. validates the 16-bit device ID and the check nibble;
-5. deduplicates on the press counter, so one press produces one event.
-
-Step 2 is the whole point: `rc_switch` reads bits from offset 0 and stops. This one keeps going, so the AGC damaging frame 1 costs nothing as long as any later frame is clean — and past frame 1, later frames are clean essentially always.
-
-The protocol itself lives in `fan_rf_protocol.h`, which has no ESPHome, Arduino or IDF dependency at all. `tools/fan_rf_selftest.cpp` compiles that exact header on the host and replays the captured logs through it, so the decoder is validated against real data before anything is flashed:
-
-    c++ -std=c++17 -O2 -o /tmp/fan_rf_selftest tools/fan_rf_selftest.cpp
-    /tmp/fan_rf_selftest --frames log3.txt      # 37/37 presses, counter +1 each
-    /tmp/fan_rf_selftest --frames log4.txt      # the cold-press case
-
-Across every log in the repo it decodes **74 presses with 74/74 field checks passing**, agreeing codeword-for-codeword with `tools/decode_fan_rf.py`. log2 is the sharpest demonstration: all 30 of its presses decode, and all 30 come from a frame other than the first — every one of them is a press the old `rc_switch_raw` sensors could not have seen.
-
-Exposed two ways. The trigger is the primitive:
+`fan_rf` exposes decodes two ways. The trigger is the primitive:
 
 ```yaml
 fan_rf:
@@ -419,36 +310,50 @@ binary_sensor:
     command: brightness_up     # or a raw byte, e.g. 0x21
 ```
 
-Unknown command bytes are accepted as valid-but-unnamed. Only three of the remote's buttons have been captured, and it is the device ID and the check nibble that validate a packet — not the command.
+Unknown command bytes are accepted as valid-but-unnamed — it is the prefix and
+the checksum that validate a packet, not the command.
 
-### Why `idle` is below the inter-frame gap
+Host-side:
 
-`idle: 4ms` is deliberately *shorter* than the 8.79 ms gap between repeats, so each of the five frames ends its own capture. That is the opposite of what this file said before, and the reason changed.
+| Tool | Does |
+|---|---|
+| `tools/decode_fan_rf.py` | Decodes a captured log offline with generous tolerances, majority-votes the repeats, and checks that the counter increments by exactly one per press — an end-to-end check that nothing was dropped. |
+| `tools/fan_rf_selftest.cpp` | Compiles `fan_rf_protocol.h` on the host and replays captured logs through it, so the firmware decoder is validated against real data before anything is flashed. A disagreement with `decode_fan_rf.py` is a real signal about the component. |
+| `tools/plot_adc.py`, `tools/adclog_to_csv.py` | Plot and convert `adc_logger` output. Dropped log lines are reported and drawn as gaps, never closed up. |
 
-The old 12 ms kept a whole burst in one capture so a decoder could scan across the repeats. `fan_rf` no longer needs that — it deduplicates on the press counter, so five repeats arriving as five captures still produce one event. Meanwhile 12 ms carries a real fault:
+```
+c++ -std=c++17 -O2 -o /tmp/fan_rf_selftest tools/fan_rf_selftest.cpp
+/tmp/fan_rf_selftest --frames log.txt      # decoded presses, counter +1 each
+/tmp/fan_rf_selftest --dump   log.txt      # what fan_rf_dump would print
+```
 
-> A held button transmits a frame every 41.1 ms with 8.79 ms between them. Nothing ever reaches 12 ms of idle, so the capture never terminates — it grows until `receive_symbols` fills at ~32 frames, then the driver truncates and re-arms, losing whatever lands during the re-arm. **That is 1.29 s of holding.**
+### Two settings that matter
 
-At 4 ms a capture is 65 entries however long the button is held. It also cuts latency: a press is reported ~37 ms after the first frame rather than ~218 ms after the whole burst.
+**`idle: 4ms`** is deliberately shorter than the 8.79 ms inter-frame gap, so each
+of the five repeats ends its own capture. `fan_rf` deduplicates on the press
+counter, so five captures still produce one event, and a press is reported ~37 ms
+after the first frame instead of ~218 ms after the whole burst. A longer idle
+that holds a whole burst in one capture never terminates while a button is held —
+frames arrive every 41.1 ms — until `receive_symbols` fills and the driver
+truncates. The safe window is bounded below by the 865 µs longest in-frame space
+and above by the 7.69 ms preamble gap.
 
-The safe window is bounded below by the longest space measured *inside* a decodable frame (865 µs over 10592 symbols) and above by the 7.69 ms preamble gap. 4 ms sits 4.6× above the floor and 1.9× below the ceiling.
+Set `idle: 12ms` when you want `fan_rf_dump`'s frame-position numbering back; at
+4 ms every line reads `f1`.
 
-Simulated end to end over all 14 logs, the press output is **identical at every idle from 12 ms down to 1.5 ms** — 74 presses, 74/74 field checks. What changes is only how many captures carry them:
+**`filter` must stay below 136 µs**, the shortest real symbol under worst-case AGC
+skew. At 200 µs the compressed early spaces are merged away and frame 1 is
+destroyed. Do not reach for it to suppress noise bursts either — their median
+pulse width is 343 µs and overlaps the real symbols completely. `filter_symbols:
+120` is the right tool for that: garbage bursts run to at most 95 symbols against
+a real packet's 166.
 
-| idle | captures emitted | max capture entries | decode events | presses |
-|---|---|---|---|---|
-| 12 ms | 1890 | 1089 | 74 | **74** |
-| 6 ms | 2378 | 941 | 331 | **74** |
-| 4 ms | 2531 | 941 | 331 | **74** |
-| 2 ms | 2969 | 355 | 331 | **74** |
+### Recording a log
 
-One thing this retires: the majority vote. Across the entire corpus **no capture ever produced two different codewords**, so the vote has never changed an outcome. It stays as cheap insurance, but with one frame per capture it no longer has anything to compare.
-
-### Dumping raw frames
-
-`firmware/components/fan_rf_dump` is the plain view underneath all of that. It prints every frame that decodes, as a 32-bit binary word, and does nothing else — no ID check, no checksum, no vote, no dedupe. The only test applied is whether the pulses match the remote's two symbol widths, and it is all-or-nothing per frame, so a corrupt frame prints nothing rather than a half-guessed word.
-
-Frames are numbered with the preamble skipped, which makes a gap in the numbering the report that a frame was corrupt:
+`dump: raw` is commented out in `sniffer.yaml`, because it prints a line for
+every capture, noise included, and buries the frames it exists to show. Day to
+day the log carries only `fan_rf_dump`'s decoded words (this example at
+`idle: 12ms`, so the frame positions are visible):
 
     [I][fan_rf_dump]: 323 symbols, 6 chunks, 4 frames decoded
     [I][fan_rf_dump]:   f2 10100001110110000010000111101001
@@ -456,46 +361,16 @@ Frames are numbered with the preamble skipped, which makes a gap in the numberin
     [I][fan_rf_dump]:   f4 10100001110110000010000111101001
     [I][fan_rf_dump]:   f5 10100001110110000010000111101001
 
-It is silent on captures that yield nothing, which is nearly all of them — logs 10, 11 and 13 hold 1721 captures between them and produce **zero** lines.
-
-The frame numbering needs a whole burst in one capture, so it only works with `idle` above the 8.79 ms inter-frame gap. At the configured `idle: 4ms` each frame is its own capture and every line reads `f1`. Set `idle: 12ms` when you want the position view back.
-
-With `dump: raw` commented out, this is the receiver's only output — one block per press, nothing between presses.
-
-It is standalone: it needs `remote_receiver` and nothing else, and carries its own copy of the frame decoder in `fan_rf_dump_protocol.h`. Drop the directory into another project and it works on its own. The trade is that the symbol timings exist in both components — re-measure the remote and both have to change. It can run alongside `fan_rf`, since every listener sees every capture, but it does not need it.
-
-`tools/fan_rf_selftest.cpp --dump LOG` reproduces the same output from a captured log, through the same `walk_frames()` the component calls.
-
-### Streaming the pad as analogue
-
-`firmware/components/adc_logger` samples an ADC pin continuously and streams every sample to the log — no trigger, no ring buffer, no thresholding. Earlier triggered revisions each decided which windows were visible, and twice presented 800 ms of pure noise as if it were a failed press.
-
-    esphome logs firmware/sniffer.yaml > log.txt
-    .venv/bin/python tools/plot_adc.py log.txt          # visual
-    python3 tools/scope_decode.py capture.csv           # threshold sweep
-
-Wiring is `pad --[10k]-- GPIO3 --[10k]-- GND`, halving 4.48 V into the C3's ~3.1 V range at 12 dB attenuation.
-
-Throughput is the limit: each sample costs 3 log characters and the logger carries roughly 30 kchar/s, so 10 kSa/s streams without loss. Every line is indexed, and dropped lines are reported and drawn as gaps rather than closed up — a silently shortened time axis would corrupt exactly the timing being measured.
-
-### Capturing more
-
-**`dump: raw` is commented out in `sniffer.yaml`.** It prints a `Received Raw:` line for every capture, noise included, and at `idle: 4ms` a session fragments noise into ~2500 captures — it buries the frames it exists to show. Day to day the log carries only `fan_rf_dump`'s decoded words, which is what you want to read.
-
-Recording a **new** `log*.txt` needs it back, because `tools/decode_fan_rf.py` and `tools/fan_rf_selftest.cpp` both parse those lines:
+Recording a new `log*.txt` needs it back, since both host tools parse those
+`Received Raw:` lines:
 
     # uncomment `dump: [raw]` in firmware/sniffer.yaml, flash, then
-    esphome logs firmware/sniffer.yaml > log17.txt
+    esphome logs firmware/sniffer.yaml > log.txt
     # and comment it out again
 
-The per-second `wifi_signal` chatter is also silenced, via `logger: logs: {sensor: WARN}`. Raise it if you are chasing an antenna or RSSI question.
-
-
-Press buttons in quick alternation, and take the first press of any session as expendable.
-
-`filter_symbols` will drop garbage bursts before they reach the log — they are at most 95 symbols against a real packet's 166 — but leave it off until the cold-press fault is closed, since that garbage is the evidence. Do not reach for `filter` instead: the garbage has a median pulse width of 343 µs and overlaps the real symbols completely, so at 200 µs it removes only a third of it while destroying frame 1.
-
-Run `tools/decode_fan_rf.py` over the log afterwards. It decodes offline with generous tolerances, majority-votes the five repeats, and checks the counter increments by exactly one per press — an end-to-end check that nothing was dropped. `tools/fan_rf_selftest.cpp` does the same thing through the firmware's own decoder, so a disagreement between the two is a real signal about the component.
+Press buttons in quick alternation. The per-second `wifi_signal` chatter is
+silenced via `logger: logs: {sensor: WARN}` — raise it if you are chasing an
+antenna or RSSI question.
 
 ---
 
@@ -551,7 +426,7 @@ Honesty about what is actually known, since someone may try to rebuild this.
 - MCU output high = 4.48 V; post-resistor = 1.12 V; drive current = 3.36 mA
 - RF receiver SOP-8 output → 1 kΩ → MCU input
 - Continuous activity on the RF data line with no button pressed
-- Remote wire format and packet layout — see [Remote protocol](#remote-protocol). Three capture sessions, 97 presses, all field checks passing; three commands identified
+- Remote wire format, frame layout, checksum and the full 20-button key table — see [PROTOCOL.md](PROTOCOL.md). Every button on the remote captured and decoded, all field checks passing
 - Receiver output pad floors at **0 V** unloaded and at **0.8 V** with a BSS138 channel attached — its two 10 kΩ pull-ups force ~620 µA into it. 0.8 V clears the MCU's 1.12 V V<sub>IL</sub> and not the ESP32's 0.825 V
 - Blade mechanism contains gears **and ~10 cm springs**
 
@@ -561,7 +436,7 @@ Honesty about what is actually known, since someone may try to rebuild this.
 - 433.92 MHz operation (from the 13.52 MHz crystal)
 - Third optocoupler is a mains-side → MCU sense path (from the 200 kΩ string at R33–R36)
 - Blade deployment is centrifugal, with the gear ring synchronising the four blades and the springs providing retraction
-- The idle RF line activity is receiver AGC noise, not a real transmission. It is present continuously — a scope shows the ESP32 pin swinging 0.8–3.3 V with nothing transmitting; gaps in the ESPHome log are the `filter` discarding it, not silence (see [Cold-press failure](#cold-press-failure))
+- The idle RF line activity is receiver AGC noise, not a real transmission. It is present continuously — a scope shows the ESP32 pin swinging 0.8–3.3 V with nothing transmitting; gaps in the ESPHome log are the `filter` discarding it, not silence
 
 ### ❓ Unknown — measure before building
 
@@ -571,7 +446,7 @@ Honesty about what is actually known, since someone may try to rebuild this.
 - [ ] Whether a pull-down exists on the MCU's RF input pin. If one does, it fights the shifter's 10 kΩ pull-up and the high level will not clear V<sub>IH</sub> — use a push-pull `74HCT1G34` instead.
 - [ ] `4614` pinout
 - [ ] Third optocoupler's actual function
-- [ ] The rest of the remote's command set — the framing is solved (see [Remote protocol](#remote-protocol)), but only brightness +, colour temp + and fan speed 1 have been captured. Power, the remaining fan speeds and any down/decrease buttons are still unrecorded.
+- [ ] Whether the 20-bit prefix is a per-remote ID, a protocol constant, or both. Separating them needs a second remote — until then, do not assume a synthesised frame is accepted by any other unit.
 
 ### Pre-flight checks
 
@@ -611,9 +486,9 @@ There is also a mechanical limit that no controller can beat. Blade deployment i
 
 ## Status
 
-🚧 Early. Reverse engineering largely done, no hardware built yet. See [Unknown](#-unknown--measure-before-building) for the measurements blocking the first build.
+🚧 Early. Reverse engineering done, no hardware built yet. See [Unknown](#-unknown--measure-before-building) for the measurements blocking the first build.
 
-The remote's wire format and packet layout are fully decoded and warm presses decode 100%. One fault is open: cold presses do not decode, and the cause is not yet known — see [Cold-press failure](#cold-press-failure). Two candidate causes have been eliminated.
+The remote is fully solved — wire format, frame layout, checksum and all 20 buttons, documented in [PROTOCOL.md](PROTOCOL.md) and decoded on-device by `fan_rf`. What remains on the RF side is porting `fan_rf` to the `KEY`/`CNT` frame model and building the transmit path; everything else is hardware work.
 
 ## License
 
