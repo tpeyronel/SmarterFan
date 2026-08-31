@@ -13,6 +13,7 @@
 // component.
 
 #include "../firmware/components/fan_rf/fan_rf_protocol.h"
+#include "../firmware/components/fan_rf_dump/fan_rf_dump_protocol.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -109,6 +110,29 @@ static std::string to_bits(uint32_t value) {
   for (int i = 0; i < 32; i++)
     out[i] = (value & (1u << (31 - i))) ? '1' : '0';
   return out;
+}
+
+// Exactly what firmware/components/fan_rf_dump prints, driven through that
+// component's OWN walk_frames() -- it carries its own standalone copy of the
+// decoder and shares nothing with fan_rf, so testing fan_rf's copy here would
+// prove nothing about it. Lets the diagnostic output be read off the captured
+// logs without flashing anything.
+static void dump_capture(const Capture &capture) {
+  namespace dump = smarterfan::fan_rf_dump;
+  std::vector<std::pair<uint16_t, uint32_t>> found;
+  const dump::FrameWalk walk = dump::walk_frames(
+      capture.durations.data(), capture.durations.size(),
+      [&](uint16_t position, uint32_t bits) { found.push_back({position, bits}); });
+
+  if (found.empty())
+    return;  // silent, the same as the component
+
+  printf("[%s][I][fan_rf_dump]: %u symbols, %u chunks, %u frames decoded\n",
+         capture.timestamp.c_str(), (unsigned) capture.durations.size(), (unsigned) walk.chunks,
+         (unsigned) walk.decoded);
+  for (const auto &entry : found)
+    printf("[%s][I][fan_rf_dump]:   f%u %s\n", capture.timestamp.c_str(), (unsigned) entry.first,
+           to_bits(entry.second).c_str());
 }
 
 // Clean-frame rate by position within a burst: the table from the task notes.
@@ -210,15 +234,33 @@ static void run_unit_checks() {
 int main(int argc, char **argv) {
   std::vector<std::string> paths;
   bool show_frames = false;
+  bool dump_mode = false;
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--frames") == 0)
       show_frames = true;
+    else if (strcmp(argv[i], "--dump") == 0)
+      dump_mode = true;
     else
       paths.push_back(argv[i]);
   }
   if (paths.empty()) {
-    fprintf(stderr, "usage: fan_rf_selftest [--frames] LOG [LOG...]\n");
+    fprintf(stderr, "usage: fan_rf_selftest [--frames] [--dump] LOG [LOG...]\n");
     return 2;
+  }
+
+  if (dump_mode) {
+    for (const std::string &path : paths) {
+      std::ifstream file(path);
+      if (!file) {
+        fprintf(stderr, "%s: cannot open\n", path.c_str());
+        return 1;
+      }
+      std::stringstream buffer;
+      buffer << file.rdbuf();
+      for (const Capture &capture : parse_captures(buffer.str()))
+        dump_capture(capture);
+    }
+    return 0;
   }
 
   run_unit_checks();

@@ -16,6 +16,10 @@ esp32:
 
 logger:
   level: DEBUG
+  # The ADC dump is ~500 lines back to back and the default 512-byte buffer
+  # drops most of them. log8.txt lost 2112 of 3584 samples this way.
+  tx_buffer_size: 8192
+  task_log_buffer_size: 4096
   # C3 has native USB-Serial-JTAG; this puts logs on the USB-C port.
   hardware_uart: USB_SERIAL_JTAG
 
@@ -44,43 +48,308 @@ ota:
   - platform: esphome
     password: !secret ota_password
 
-sensor:
-  # Raw RSSI once per second — for watching antenna changes live.
-  - platform: wifi_signal
-    name: "WiFi signal"
-    id: wifi_rssi
-    update_interval: 1s
+# sensor:
+#   # Raw RSSI once per second — for watching antenna changes live.
+#   - platform: wifi_signal
+#     name: "WiFi signal"
+#     id: wifi_rssi
+#     update_interval: 1s
 
-  # RSSI bounces several dB on its own. Compare THIS between antenna
-  # configurations, not the raw value above.
-  - platform: wifi_signal
-    name: "WiFi signal median"
-    update_interval: 1s
-    filters:
-      - median:
-          window_size: 10
-          send_every: 10
+#   # RSSI bounces several dB on its own. Compare THIS between antenna
+#   # configurations, not the raw value above.
+#   - platform: wifi_signal
+#     name: "WiFi signal median"
+#     update_interval: 1s
+#     filters:
+#       - median:
+#           window_size: 10
+#           send_every: 10
 
 remote_receiver:
   pin:
+    # Back on GPIO6, fed by the 10k/22k divider from the receiver output pad.
+    #
+    # 10k/22k puts 3.08V on the pin, clearing the C3's Vih of 2.475V. Do NOT
+    # use 10k/10k here: that gives 2.24V, which is inside the undefined band
+    # between Vil and Vih. GPIO3 was borrowed for a test at that level and it
+    # is not a sound configuration to leave in place.
+    #
+    # A resistive divider is the right tap for this line. Unlike the BSS138
+    # module it has no path from any supply into the pad -- only to ground --
+    # so it cannot lift the receiver's low level the way the shifter's two
+    # pull-ups do (they push ~620uA in, holding the pad at 0.8V instead of 0V).
     number: GPIO6
-  dump: all
+  # `raw` only. `dump: all` ran every IR decoder ESPHome ships against a
+  # 433 MHz OOK capture; none can ever match. The "Beo4: n_sym=..." line on
+  # every packet was that decoder's length precondition printing, not a hit
+  # (a real match logs "Beo4: source=... command=..." — it never did).
+  #
+  # `rc_switch` is deliberately NOT listed: RCSwitchDumper::dump() hardcodes
+  # a loop over its 8 built-in timing profiles and ignores any custom one, so
+  # as a *dumper* it can never recognise this remote. Don't read its silence
+  # as evidence about the protocol.
+  #
+  # NO dumper. `dump: raw` prints "Received Raw: ..." for EVERY capture,
+  # noise included, and at `idle: 4ms` noise fragments into ~2500 captures
+  # across a session -- it buries the frames it was meant to reveal.
+  #
+  # Nothing is lost day to day: `fan_rf_dump` below prints the decoded 32-bit
+  # words and stays silent when a capture yields nothing, which is what you
+  # actually want to read.
+  #
+  # RE-ENABLE for a capture session. tools/decode_fan_rf.py and
+  # tools/fan_rf_selftest.cpp both parse `Received Raw:` lines, so recording a
+  # new log*.txt needs this on. Uncomment, run `esphome logs > logN.txt`, then
+  # comment it out again.
+  #
+  # dump:
+  #   - raw
 
   # --- Tuning knobs -------------------------------------------------
   # The receiver's AGC outputs continuous noise when nothing is
   # transmitting. Raise `filter` until the log goes quiet with no button
   # pressed, then confirm real packets still get through.
-  filter: 200us
+  #
+  # 200us was TOO HIGH and was corrupting real data. This remote's short
+  # symbol is a ~242us space, and while the AGC settles at the start of a
+  # transmission those spaces sag to just under 200us — where `filter` drops
+  # them, merging three symbols into one long mark. Measured over 30 captures
+  # in log2.txt: the shortest surviving space was exactly 200us (clipped at
+  # the threshold), and frame 1 of every single capture was mangled (125
+  # merged marks, ~26 of 32 bits recoverable) while frames 3-5 were perfect.
+  # 100us sits well clear of the 242us symbol and still rejects fast noise.
+  #
+  # Back to 100us. The 20us diagnostic setting below did its job, but it also
+  # destroyed the trigger: at 20us the idle noise generates RMT captures, so
+  # on_raw fires constantly and the ADC ring gets dumped on random noise
+  # windows instead of on presses. log10.txt is 755ms of pure noise for exactly
+  # this reason. At 100us the noise falls under the threshold, no capture is
+  # emitted, and on_raw is press-correlated again — which is what makes it
+  # usable as the ADC trigger. `filter` does not affect the analogue path at
+  # all, so nothing is lost from the ADC record by raising it.
+  #
+  # (kept for reference) 20us exposed what the pin does during a cold press. At
+  # filter: 100us the garbage pulse-width histogram piles up hard against the
+  # threshold (50 pulses in 100-110us, decaying monotonically upward) — the
+  # distribution is truncated, not tailing off, exactly the way log2's frame 1
+  # was clipped at its own 200us threshold. That means real activity below
+  # 100us is being merged away, and the "long marks" in the garbage are partly
+  # an artefact of that merging.
+  #
+  # Dropping to 20us costs nothing on a good packet — the shortest pulse in a
+  # clean capture is 158us — but on a cold press it should reveal the chatter
+  # directly. Expect a lot of log volume, and possibly "Buffer overflow"
+  # warnings; both are results, not problems.
+  filter: 100us
 
-  # Gap that marks the end of a packet. Raise if single presses are being
-  # split into multiple partial dumps.
-  idle: 10ms
+  # DIAGNOSTIC — pulse a spare GPIO whenever a capture completes, so a scope
+  # can trigger on exactly the events the ESP32 sees.
+  #
+  # This is the ONLY workable scope trigger here. The line carries continuous
+  # 0.8-3.3V noise (measured on a scope at the pin), so no voltage threshold
+  # discriminates a press from the background. But captures are still
+  # press-correlated — idle noise produces none, because those pulses fall
+  # under the 20us `filter` and RMT records no symbols for them. So this pulse
+  # fires on presses and not on idle noise, which a level trigger cannot do.
+  #
+  # `on_raw` runs in loop(), after the 12 ms idle timeout that ends the
+  # capture, so the pulse lands roughly 15-20 ms AFTER the burst finishes.
+  # Put the scope's trigger point at the far RIGHT of the screen and use
+  # ~250 ms of pre-trigger to see the burst that caused it.
 
-  # Timing match slack. Loosen if `dump: all` almost-but-not-quite
-  # recognises a protocol.
-  tolerance: 25%
+  # `filter_symbols: 120` would drop the garbage bursts (max 95 symbols) while
+  # passing real packets (166) — but leave it OFF while the cold-press fault
+  # is still open. That garbage is the only evidence we have of what the
+  # receiver does during a failed press, and the log is not actually flooded:
+  # a whole session is ~15 captures. See README, "Cold-press failure".
+
+  # One rmt_receive() call holds `receive_symbols` symbols; it completes on
+  # `idle` OR when that buffer fills, and the driver then re-arms. Anything
+  # arriving during the re-arm is lost.
+  #
+  # The 192 default was silently eating cold presses. A clean warm packet is
+  # 166 symbols and fits. A cold press adds so many chatter edges that it hits
+  # the ceiling and truncates — measured at 190 symbols in log5 and 191 in
+  # log6, against the 192 limit, while log4's warm packet sat at 166. In log5
+  # the resulting hole was 395 ms with nothing captured, and a transmission is
+  # only 206 ms, so the packet fit entirely inside it.
+  #
+  # 1024 gives ~758 ms of continuous capture at the ~2700 edges/s a cold press
+  # produces. Nothing changes for a clean packet: it still ends on `idle` at
+  # 166 symbols exactly as before.
+  receive_symbols: 1024
+
+  # Must hold at least 2*(event + receive_size); receive_size is now 4 KB, so
+  # the 10000 default would leave room for barely two queued captures.
+  buffer_size: 32768
+
+  # Gap that ends a capture. Deliberately BELOW the 8.79ms inter-frame gap,
+  # so each of the five repeats becomes its own capture.
+  #
+  # This was 12ms, chosen to keep a whole burst in one capture so a decoder
+  # could scan across the repeats. That is no longer needed -- `fan_rf`
+  # deduplicates on the press counter, so five repeats arriving as five
+  # captures still produce exactly one event -- and 12ms carries a real bug.
+  #
+  # A held button keeps transmitting frames every 41.1ms with only 8.79ms
+  # between them. Nothing ever reaches 12ms of idle, so the capture never
+  # terminates: it grows until `receive_symbols` fills at ~32 frames, then
+  # the driver truncates and re-arms, losing whatever arrives during the
+  # re-arm. That is 1.29 seconds of holding -- an ordinary press-and-hold.
+  #
+  # At 4ms every frame completes on its own and a capture is 65 entries no
+  # matter how long the button is held. It also cuts latency: a press is
+  # reported ~37ms after the first frame instead of ~218ms after the burst.
+  #
+  # 4ms sits 4.6x above the longest space measured inside a decodable frame
+  # (865us over 10592 symbols) and 1.9x below the 7.69ms preamble gap, so it
+  # can neither split a frame nor merge two.
+  #
+  # Verified offline across all 14 logs: 74 presses, 74/74 field checks, at
+  # every idle from 12ms down to 1.5ms. The output does not change.
+  #
+  # NOTE: raise this back to 12ms if you want `fan_rf_dump`'s frame-position
+  # numbering -- that view needs the whole burst in one capture.
+  idle: 4ms
+
+  # Timing match slack. Neither `fan_rf` nor `fan_rf_dump` reads this -- each
+  # carries its own matching window -- but any other listener on this receiver
+  # would, so it is left at the value that was established for rc_switch.
+  #
+  # 25% was too tight and the sensors fired on 5 of 37 presses. The AGC does
+  # not just settle in amplitude, it skews the duty cycle: in the first frame
+  # of a transmission marks stretch and short spaces compress, so the 242us
+  # short space arrives as little as 136us. Measured across log2+log3, the
+  # short space alone spans 136-312us, an inherent 39% spread that no choice
+  # of nominal can cover at 25%.
+  #
+  # 40% covers every one of the 9664 symbols measured with zero outliers, and
+  # is still unambiguous: the mark windows are [172,403] and [480,1120], the
+  # space windows [134,313] and [422,985]. Neither pair overlaps, because the
+  # two symbol classes sit a clean 3:1 apart.
+  tolerance: 40%
+
+# --- Decoded remote buttons ------------------------------------------
+# Protocol reverse-engineered from log.txt + log2.txt + log3.txt.
+# 32 bits, MSB first:
+#
+#   [ 0..15] 0xA1D8  remote / device ID, identical in every packet
+#   [16..23] command 0x21 brightness+, 0x23 colour temp+, 0x28 fan speed 1
+#   [24..27] high nibble = [domain flag][3-bit press counter]
+#   [28..31] low nibble  = high nibble XOR (command & 0x0F) XOR 6
+#
+# Wire format: ~350us mark + 7.7ms gap, then 5 repeats of {32 bits, ~330us
+# stop mark, 8.79ms gap}. The symbol encoding is a single 252us tick, 1:3 --
+# bit 0 = 1 tick mark + 3 tick space, bit 1 = 3 tick mark + 1 tick space,
+# period 4 ticks = 1008us, measured at 1009us with a 3.3us spread.
+#
+# Received pulses do not sit on those values: the receiver stretches marks and
+# eats spaces by the same amount, so the components match each pulse loosely
+# (50%) and the bit period tightly (5%), the period being the quantity that
+# bias cancels out of.
+#
+# The three `rc_switch_raw` binary sensors that used to live here are gone,
+# and no tuning could have saved them. RCSwitchBase::decode() calls
+# expect_sync() once and then reads bits from offset 0 of the capture; it
+# never rescans at another offset. Each press sends the same frame five
+# times and the receiver's AGC corrupts the FIRST one while it settles, so
+# the built-in decoder always failed on the one damaged frame and never
+# looked at frames 2-5 sitting behind it, intact. Measured on a cold press
+# (log4.txt): frame 1 decodes 40% of the time, frames 3-5 decode 100%.
+# That gap is exactly what the sensors' 5-of-37 hit rate was.
+#
+# `fan_rf` below splits the capture on the inter-frame gap, decodes every
+# frame independently, and majority-votes the survivors.
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [fan_rf_dump]
+    # components: [fan_rf, fan_rf_dump]
+
+# fan_rf:
+#   id: fan_remote
+#   # Five repeats of one press share a codeword, so an identical code inside
+#   # this window is the same press arriving twice (a burst split across two
+#   # captures, or a held button) rather than a new one. Consecutive presses
+#   # always differ in press counter, so this cannot swallow a real press.
+#   dedup_window: 1000ms
+
+#   # The useful primitive: fires once per press with the command byte, the
+#   # press counter, and the raw 32-bit code. Bind actions here.
+#   on_code:
+#     - lambda: |-
+#         ESP_LOGI("remote", "press cmd=0x%02X counter=%u code=0x%08lX",
+#                  command, counter, (unsigned long) code);
+
+# DIAGNOSTIC — the plain view of what the receiver delivered.
+#
+# Prints every frame that decodes as 32 clean bits, as a binary word, and
+# nothing else: no ID check, no checksum, no vote, no dedupe. The only test is
+# whether the pulses match the remote's two symbol widths, applied
+# all-or-nothing per frame — so a corrupt frame prints nothing rather than a
+# half-guessed word.
+#
+# Frames are numbered with the preamble skipped, so a gap in the numbering is
+# the report that a frame was corrupt. Silent on captures that yield nothing,
+# which is most of them.
+#
+# Standalone — it needs `remote_receiver` and nothing else, and carries its own
+# copy of the frame decoder. It is listed here alongside `fan_rf` only because
+# both are wanted; neither needs the other. Costs nothing to leave on: every
+# listener sees every capture, so the two decode the same data independently.
+fan_rf_dump:
+  id: fan_remote_dump
+
+# binary_sensor:
+#   - platform: fan_rf
+#     name: "Remote: brightness up"
+#     command: brightness_up
+
+#   - platform: fan_rf
+#     name: "Remote: colour temp up"
+#     command: colour_temp_up
+
+#   - platform: fan_rf
+#     name: "Remote: fan speed 1"
+#     command: fan_speed_1
 
 # --- Milestone 2: uncomment once you have captures to replay ----------
 # remote_transmitter:
 #   pin: GPIO5
 #   carrier_duty_percent: 100%   # OOK — no carrier modulation at baseband
+
+# DIAGNOSTIC — raw analogue streamer on GPIO3 (ADC1 channel 3).
+#
+#   pad --[10k]-- GPIO3 --[10k]-- GND
+#
+# Halves 4.48V to 2.24V, inside the C3's ~3.1V range at 12dB attenuation.
+# 20k total is a 0.22mA load and a 5k source impedance. Take this straight
+# off the pad -- NOT through the BSS138, whose pull-ups lift the low level.
+#
+# Streams continuously with no trigger. Every previous triggered version ended
+# up choosing which windows we were allowed to look at, and twice that meant
+# 800ms of pure noise presented as if it were a failed press.
+# ---------------------------------------------------------------------------
+# Analogue streamer DISABLED for this test: GPIO3 cannot serve the ADC and the
+# RMT at the same time -- the ADC driver claims the pad's analogue function and
+# the RMT needs its digital input.
+#
+# No reference is lost by this. That node is already known to carry clean
+# packets: log13 and log14 decoded three presses off it with sequential
+# counters and checksums passing. So if the RMT produces garbage from the same
+# node, the fault is in the digital path, not in the signal.
+#
+# Re-enable by deleting the "# " below (and move the RMT pin back to GPIO6).
+# ---------------------------------------------------------------------------
+# external_components:
+#   - source:
+#       type: local
+#       path: components
+#     components: [adc_logger]
+#
+# adc_logger:
+#   id: adc_log
+#   channel: 3
+#   sample_rate: 10000
+#   queue_lines: 32

@@ -71,9 +71,11 @@ void FanRfDecoder::publish_(const Packet &packet) {
 void FanRfDecoder::dump_config() {
   ESP_LOGCONFIG(TAG, "Novohome NH-VTR500 RF decoder:");
   ESP_LOGCONFIG(TAG, "  Device ID: 0x%04X", DEVICE_ID);
-  ESP_LOGCONFIG(TAG, "  Symbols: bit0 %uus/%uus, bit1 %uus/%uus at %u%% tolerance",
-                (unsigned) MARK_SHORT_US, (unsigned) SPACE_LONG_US, (unsigned) MARK_LONG_US,
-                (unsigned) SPACE_SHORT_US, (unsigned) TOLERANCE_PCT);
+  ESP_LOGCONFIG(TAG, "  Symbols: bit0 %uus/%uus, bit1 %uus/%uus at %u%% width slack",
+                (unsigned) SHORT_US, (unsigned) LONG_US, (unsigned) LONG_US, (unsigned) SHORT_US,
+                (unsigned) WIDTH_TOLERANCE_PCT);
+  ESP_LOGCONFIG(TAG, "  Bit period: %uus +/-%u%%", (unsigned) PERIOD_US,
+                (unsigned) PERIOD_TOLERANCE_PCT);
   ESP_LOGCONFIG(TAG, "  Frame split gap: %uus", (unsigned) FRAME_GAP_US);
   ESP_LOGCONFIG(TAG, "  Dedup window: %" PRIu32 " ms", this->filter_.get_window_ms());
   ESP_LOGCONFIG(TAG, "  Buttons: %u", (unsigned) this->sensors_.size());
