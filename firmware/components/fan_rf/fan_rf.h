@@ -1,10 +1,9 @@
 // ESPHome binding for the Novohome NH-VTR500 remote decoder.
 //
-// Registers as a listener on `remote_receiver`, hands each raw capture to the
-// frame decoder shared with fan_rf_dump, and turns the resulting stream of
-// frames into press and repeat events through the framework-free packet layer
-// in fan_rf_protocol.h. This file is only plumbing: dispatch to the trigger and
-// to the per-key binary sensors.
+// Registers as a listener on `remote_receiver` and runs each raw capture down
+// the three stages in fan_rf_protocol.h: capture -> frames -> packets ->
+// presses. This file is only plumbing: the two console dumps, and dispatch to
+// the trigger and the per-key binary sensors.
 //
 // Frames are processed one at a time, in the order they arrive, and the press
 // tracker is fed per frame rather than per capture. That makes the component
@@ -28,12 +27,20 @@
 namespace smarterfan {
 namespace fan_rf {
 
+// Frames listed on one `dump_frames` line before it gives up and says how many
+// more there were. A capture normally holds exactly one frame -- `idle` sits
+// below the inter-frame gap -- and at most five when it does not, so this only
+// bites on a held button captured whole.
+static const uint8_t MAX_DUMPED_FRAMES = 8;
+
 class FanRfBinarySensor;
 
 class FanRfDecoder : public esphome::Component, public esphome::remote_base::RemoteReceiverListener {
  public:
   void set_press_frames(uint8_t frames) { this->tracker_.set_press_frames(frames); }
   void set_run_timeout(uint32_t ms) { this->tracker_.set_run_timeout_ms(ms); }
+  void set_dump_frames(bool dump) { this->dump_frames_ = dump; }
+  void set_dump_commands(bool dump) { this->dump_commands_ = dump; }
   void register_binary_sensor(FanRfBinarySensor *sensor) { this->sensors_.push_back(sensor); }
   void add_on_code_callback(std::function<void(uint8_t, uint8_t, uint32_t, uint32_t)> &&callback) {
     this->callbacks_.add(std::move(callback));
@@ -54,6 +61,8 @@ class FanRfDecoder : public esphome::Component, public esphome::remote_base::Rem
   std::vector<FanRfBinarySensor *> sensors_;
   esphome::CallbackManager<void(uint8_t, uint8_t, uint32_t, uint32_t)> callbacks_;
   PressTracker tracker_;
+  bool dump_frames_{false};
+  bool dump_commands_{true};
 };
 
 class FanRfBinarySensor : public esphome::binary_sensor::BinarySensorInitiallyOff,

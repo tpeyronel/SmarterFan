@@ -1,5 +1,8 @@
 #include "fan_rf.h"
 
+#include <cstdio>
+#include <cstring>
+
 namespace smarterfan {
 namespace fan_rf {
 
@@ -13,10 +16,27 @@ bool FanRfDecoder::process_raw(const std::vector<int32_t> &raw) {
   const uint32_t now = esphome::millis();
   bool any = false;
 
-  // walk_frames() splits the capture on the inter-frame gap and decodes each
-  // chunk from its own start, so the AGC-damaged first frame of a burst costs
-  // nothing as long as a later one is clean. Frames arrive here in order.
-  const FrameWalk walk = walk_frames(raw.data(), raw.size(), [&](uint16_t, uint32_t bits) {
+  // One line per capture, built as the frames come out. Comma-separated
+  // codewords, because a capture normally carries exactly one.
+  char words[MAX_DUMPED_FRAMES * (PACKET_BITS + 2) + 1];
+  size_t used = 0;
+  uint16_t dumped = 0;
+  words[0] = '\0';
+
+  // Stage 1 -> 2 -> 3. walk_frames() splits the capture on the inter-frame gap
+  // and decodes each chunk from its own start, so the AGC-damaged first frame
+  // of a burst costs nothing as long as a later one is clean.
+  const FrameWalk walk = walk_frames(raw.data(), raw.size(), [&](uint32_t bits) {
+    if (this->dump_frames_ && dumped < MAX_DUMPED_FRAMES) {
+      if (used != 0) {
+        words[used++] = ',';
+        words[used++] = ' ';
+      }
+      format_bits(bits, &words[used]);
+      used += PACKET_BITS;
+      dumped++;
+    }
+
     const Packet packet = decode_packet(bits);
     if (!packet.valid()) {
       // 32 pulses at the remote's symbol widths that still fail the prefix or
@@ -34,20 +54,27 @@ bool FanRfDecoder::process_raw(const std::vector<int32_t> &raw) {
       return;
     }
 
-    if (event.repeat == 0) {
-      ESP_LOGD(TAG, "press  key=%2u (%s) counter=%u  0x%08" PRIX32, packet.key,
-               key_name(packet.key), packet.counter, packet.raw);
-    } else {
-      ESP_LOGD(TAG, "repeat key=%2u (%s) counter=%u  0x%08" PRIX32 "  #%" PRIu32, packet.key,
-               key_name(packet.key), packet.counter, packet.raw, event.repeat);
+    if (this->dump_commands_) {
+      if (event.repeat == 0) {
+        ESP_LOGD(TAG, "press  key=%2u (%s) counter=%u  0x%08" PRIX32, packet.key,
+                 key_name(packet.key), packet.counter, packet.raw);
+      } else {
+        ESP_LOGD(TAG, "repeat key=%2u (%s) counter=%u  0x%08" PRIX32 "  #%" PRIu32, packet.key,
+                 key_name(packet.key), packet.counter, packet.raw, event.repeat);
+      }
     }
     this->publish_(packet, event.repeat);
   });
 
+  // Silent on captures that decode nothing, which is nearly all of them: idle
+  // noise produces captures constantly and a session runs to hundreds.
+  if (this->dump_frames_ && walk.decoded > 0) {
+    ESP_LOGD(TAG, "%u symbols, %u chunk%s, %u frame%s: %s%s", (unsigned) raw.size(),
+             (unsigned) walk.chunks, walk.chunks == 1 ? "" : "s", (unsigned) walk.decoded,
+             walk.decoded == 1 ? "" : "s", words, walk.decoded > dumped ? ", ..." : "");
+  }
+
   if (!any) {
-    // Idle noise produces captures constantly. Keep this at VERBOSE: a session
-    // runs to hundreds of them, and one line each at DEBUG would bury the
-    // presses this component exists to report.
     ESP_LOGV(TAG, "no valid packet (%u symbols, %u chunks, %u frames decoded)",
              (unsigned) raw.size(), (unsigned) walk.chunks, (unsigned) walk.decoded);
   }
@@ -74,14 +101,16 @@ void FanRfDecoder::dump_config() {
   ESP_LOGCONFIG(TAG, "Novohome NH-VTR500 RF decoder:");
   ESP_LOGCONFIG(TAG, "  Prefix: 0x%05" PRIX32 " (20 bits)", PREFIX);
   ESP_LOGCONFIG(TAG, "  Symbols: bit0 %uus/%uus, bit1 %uus/%uus at %u%% width slack",
-                (unsigned) frame::SHORT_US, (unsigned) frame::LONG_US, (unsigned) frame::LONG_US,
-                (unsigned) frame::SHORT_US, (unsigned) frame::WIDTH_TOLERANCE_PCT);
-  ESP_LOGCONFIG(TAG, "  Bit period: %uus +/-%u%%", (unsigned) frame::PERIOD_US,
-                (unsigned) frame::PERIOD_TOLERANCE_PCT);
-  ESP_LOGCONFIG(TAG, "  Frame split gap: %uus", (unsigned) frame::FRAME_GAP_US);
+                (unsigned) SHORT_US, (unsigned) LONG_US, (unsigned) LONG_US, (unsigned) SHORT_US,
+                (unsigned) WIDTH_TOLERANCE_PCT);
+  ESP_LOGCONFIG(TAG, "  Bit period: %uus +/-%u%%", (unsigned) PERIOD_US,
+                (unsigned) PERIOD_TOLERANCE_PCT);
+  ESP_LOGCONFIG(TAG, "  Frame split gap: %uus", (unsigned) FRAME_GAP_US);
   ESP_LOGCONFIG(TAG, "  Press: first %u identical frames report once, each frame after repeats",
                 (unsigned) this->tracker_.get_press_frames());
   ESP_LOGCONFIG(TAG, "  Run timeout: %" PRIu32 " ms", this->tracker_.get_run_timeout_ms());
+  ESP_LOGCONFIG(TAG, "  Dump raw frames: %s", YESNO(this->dump_frames_));
+  ESP_LOGCONFIG(TAG, "  Dump commands: %s", YESNO(this->dump_commands_));
   ESP_LOGCONFIG(TAG, "  Buttons: %u", (unsigned) this->sensors_.size());
 }
 

@@ -7,19 +7,18 @@ times, and the receiver's AGC damages the *first* one while it settles -- so the
 built-in decoder always tries the one frame that is broken and never looks at
 frames 2-5 sitting behind it, intact.
 
-The frame layer comes from the sibling `fan_rf_dump` component, AUTO_LOADed for
-its header alone: no `fan_rf_dump:` block in the config means the source is in
-the build but no dumper is created. Add the block if you also want the raw
-frames printed. Sharing that decoder is deliberate -- the symbol timings have
-one definition, so re-measuring the remote changes one file.
+The whole pipeline lives here, in three stages:
 
-Both names must appear under `external_components: components:`, because that
-list is what the component finder is allowed to import. AUTO_LOAD cannot reach
-a component the list leaves out.
+    raw capture --> frames --> packets --> presses
 
-On top of it this component splits a 32-bit word into prefix, key, press counter
-and checksum, validates it, and counts frames to tell a tap from a hold. The
-packet layer lives in fan_rf_protocol.h, free of any framework dependency and
+Each stage can be watched from the console. `dump_frames` prints one line per
+capture carrying the 32-bit codewords exactly as they came off the wire, before
+any field is looked at -- that is the diagnostic that says what the receiver
+actually delivered. `dump_commands` prints the decoded button presses. Both go
+out at DEBUG. Under them sits `remote_receiver`'s own `dump: raw`, which prints
+the pulse durations that feed stage one.
+
+All three stages are in fan_rf_protocol.h, free of any framework dependency and
 compiled unchanged into tools/fan_rf_selftest.cpp. The protocol itself is
 documented in PROTOCOL.md.
 """
@@ -32,9 +31,10 @@ from esphome.const import CONF_ID, CONF_TRIGGER_ID
 
 CODEOWNERS = ["@torval"]
 DEPENDENCIES = ["remote_receiver"]
-AUTO_LOAD = ["fan_rf_dump"]
 MULTI_CONF = True
 
+CONF_DUMP_COMMANDS = "dump_commands"
+CONF_DUMP_FRAMES = "dump_frames"
 CONF_FAN_RF_ID = "fan_rf_id"
 CONF_ON_CODE = "on_code"
 CONF_PRESS_FRAMES = "press_frames"
@@ -69,6 +69,13 @@ CONFIG_SCHEMA = (
             cv.Optional(
                 CONF_RUN_TIMEOUT, default="250ms"
             ): cv.positive_time_period_milliseconds,
+            # Stage 1 out: one line per capture, listing every 32-bit word
+            # that decoded, before any field is inspected. Off by default --
+            # it is the diagnostic for when something is wrong, and idle noise
+            # produces captures constantly.
+            cv.Optional(CONF_DUMP_FRAMES, default=False): cv.boolean,
+            # Stage 3 out: the decoded button presses and held repeats.
+            cv.Optional(CONF_DUMP_COMMANDS, default=True): cv.boolean,
             cv.Optional(CONF_ON_CODE): automation.validate_automation(
                 {cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(FanRfCodeTrigger)}
             ),
@@ -85,6 +92,8 @@ async def to_code(config):
     await remote_base.register_listener(var, config)
     cg.add(var.set_press_frames(config[CONF_PRESS_FRAMES]))
     cg.add(var.set_run_timeout(config[CONF_RUN_TIMEOUT]))
+    cg.add(var.set_dump_frames(config[CONF_DUMP_FRAMES]))
+    cg.add(var.set_dump_commands(config[CONF_DUMP_COMMANDS]))
 
     for conf in config.get(CONF_ON_CODE, []):
         trigger = cg.new_Pvariable(conf[CONF_TRIGGER_ID], var)

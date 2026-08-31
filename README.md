@@ -272,17 +272,37 @@ Three properties of it shape the rest of this project:
 ## Tooling
 
 Receive-side only, and none of it needs the board modified — just the sniff tap.
-`firmware/sniffer.yaml` is the ESPHome build, and it loads three local
-components:
+`firmware/sniffer.yaml` is the ESPHome build, and it loads two local components:
 
 | Component | Does |
 |---|---|
-| `firmware/components/fan_rf_dump` | The frame layer, and the only copy of it in the repo. Splits a capture on gaps over 5 ms and decodes each chunk independently as 32 PWM bits, all-or-nothing — one symbol matching neither bit throws the frame away, so a corrupt frame yields nothing rather than a half-guessed word. As a component it prints those words and does nothing else: no field checks, no dedupe. Standalone; needs `remote_receiver` and nothing else. |
-| `firmware/components/fan_rf` | The packet layer, built on that. Splits each 32-bit word into prefix, key, press counter and checksum, validates it, names the button, and counts frames to tell a tap from a hold. It `AUTO_LOAD`s `fan_rf_dump` for the header alone, so the symbol timings have exactly one definition. Name both in `external_components`, but add a `fan_rf_dump:` block only if you also want the raw frames printed — without one you get the shared decoder and no dumper. |
+| `firmware/components/fan_rf` | The decoder, in three stages. **Capture → frames:** split on gaps over 5 ms and decode each chunk independently as 32 PWM bits, all-or-nothing — one symbol matching neither bit throws the frame away, so a corrupt frame yields nothing rather than a half-guessed word. **Frame → packet:** split the word into prefix, key, press counter and checksum, and validate it. **Packets → presses:** count identical codewords to tell a tap from a hold. Nothing lower reaches up; the frame decoder has no idea what a press is. |
 | `firmware/components/adc_logger` | Streams an ADC pin's samples to the log continuously — no trigger, no thresholding — for looking at the pad as an analogue waveform. Wiring is `pad --[10k]-- GPIO3 --[10k]-- GND`; 10 kSa/s fits in the log's throughput. |
 
-Both headers are free of ESPHome, Arduino and IDF dependencies, so they compile
-unchanged on the host.
+All three stages live in `fan_rf/fan_rf_protocol.h`, free of ESPHome, Arduino
+and IDF dependencies, so it compiles unchanged on the host.
+
+### Watching the pipeline
+
+Each stage prints, and each is a separate switch:
+
+| Switch | Stage | Shows |
+|---|---|---|
+| `remote_receiver: dump: [raw]` | into stage 1 | Pulse durations for every capture, noise included. Off — see [Recording a log](#recording-a-log). |
+| `fan_rf: dump_frames: true` | stage 1 out | One line per capture, listing the 32-bit words that decoded, before any field is inspected. Off by default. |
+| `fan_rf: dump_commands: true` | stage 3 out | The decoded presses and held repeats. On by default. |
+
+Both `fan_rf` dumps go out at `DEBUG`, and the frame dump stays silent on
+captures that decode nothing — which is nearly all of them.
+
+```
+[D][fan_rf]: 65 symbols, 2 chunks, 1 frame: 10100001110110000010000111101001
+[D][fan_rf]: press  key= 3 (bright+) counter=6  0xA1D82169
+[D][fan_rf]: repeat key= 3 (bright+) counter=6  0xA1D82169  #1
+```
+
+`idle` sits below the inter-frame gap, so a capture normally carries exactly one
+frame. Raise it to `12ms` and a whole burst lands on one line, comma-separated.
 
 ### Press and hold
 
@@ -314,6 +334,8 @@ fan_rf:
   id: fan_remote
   press_frames: 5      # frames that make up one press
   run_timeout: 250ms   # silence that ends a run
+  dump_frames: false   # stage 1 out, the raw 32-bit words
+  dump_commands: true  # stage 3 out, the decoded presses
   on_code:
     - lambda: |-
         ESP_LOGI("remote", "key=%u counter=%u repeat=%lu",
@@ -345,14 +367,14 @@ Host-side:
 | Tool | Does |
 |---|---|
 | `tools/decode_fan_rf.py` | Decodes a captured log offline with generous tolerances, majority-votes the repeats, and checks that the counter increments by exactly one per press — an end-to-end check that nothing was dropped. |
-| `tools/fan_rf_selftest.cpp` | Compiles the firmware's own headers on the host and checks them: the full key table against the codewords in PROTOCOL.md, the checksum against every single-bit corruption, and the press/repeat state machine end to end through synthesised bursts — clean, AGC-skewed, frame 1 destroyed, held, and pure noise. Needs no capture log. Give it one and it replays that too. |
+| `tools/fan_rf_selftest.cpp` | Compiles the firmware's own header on the host and checks it: the full key table against the codewords in PROTOCOL.md, the checksum against every single-bit corruption, and the press/repeat state machine end to end through synthesised bursts — clean, AGC-skewed, frame 1 destroyed, held, and pure noise. Needs no capture log. Give it one and it replays that too. |
 | `tools/plot_adc.py`, `tools/adclog_to_csv.py` | Plot and convert `adc_logger` output. Dropped log lines are reported and drawn as gaps, never closed up. |
 
 ```
 c++ -std=c++17 -O2 -o /tmp/fan_rf_selftest tools/fan_rf_selftest.cpp
-/tmp/fan_rf_selftest                       # 527 checks, no log needed
+/tmp/fan_rf_selftest                       # 529 checks, no log needed
 /tmp/fan_rf_selftest log.txt               # replay a capture through the decoder
-/tmp/fan_rf_selftest --dump log.txt        # what fan_rf_dump would print
+/tmp/fan_rf_selftest --dump log.txt        # what dump_frames would print
 ```
 
 ### Two settings that matter
@@ -366,9 +388,6 @@ frames arrive every 41.1 ms — until `receive_symbols` fills and the driver
 truncates. The safe window is bounded below by the 865 µs longest in-frame space
 and above by the 7.69 ms preamble gap.
 
-Set `idle: 12ms` when you want `fan_rf_dump`'s frame-position numbering back; at
-4 ms every line reads `f1`.
-
 **`filter` must stay below 136 µs**, the shortest real symbol under worst-case AGC
 skew. At 200 µs the compressed early spaces are merged away and frame 1 is
 destroyed. Do not reach for it to suppress noise bursts either — their median
@@ -379,15 +398,9 @@ a real packet's 166.
 ### Recording a log
 
 `dump: raw` is commented out in `sniffer.yaml`, because it prints a line for
-every capture, noise included, and buries the frames it exists to show. Day to
-day the log carries only `fan_rf_dump`'s decoded words (this example at
-`idle: 12ms`, so the frame positions are visible):
-
-    [I][fan_rf_dump]: 323 symbols, 6 chunks, 4 frames decoded
-    [I][fan_rf_dump]:   f2 10100001110110000010000111101001
-    [I][fan_rf_dump]:   f3 10100001110110000010000111101001
-    [I][fan_rf_dump]:   f4 10100001110110000010000111101001
-    [I][fan_rf_dump]:   f5 10100001110110000010000111101001
+every capture, noise included, and buries the frames it exists to show. It is
+the stage below `dump_frames` — the pulse durations that feed the decoder rather
+than the words that come out of it.
 
 Recording a new `log*.txt` needs it back, since both host tools parse those
 `Received Raw:` lines:

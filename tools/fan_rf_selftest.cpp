@@ -1,13 +1,13 @@
 // Host self-test for the on-device decoder.
 //
-// Compiles the exact headers the firmware uses -- fan_rf/fan_rf_protocol.h and,
-// through it, fan_rf_dump/fan_rf_dump_protocol.h -- so the decoder can be
-// validated before anything is flashed.
+// Compiles the exact header the firmware uses -- fan_rf/fan_rf_protocol.h,
+// which carries all three stages -- so the decoder can be validated before
+// anything is flashed.
 //
 //   c++ -std=c++17 -O2 -o /tmp/fan_rf_selftest tools/fan_rf_selftest.cpp
 //   /tmp/fan_rf_selftest                   # unit + synthetic burst checks
 //   /tmp/fan_rf_selftest log.txt           # replay a captured `dump: raw` log
-//   /tmp/fan_rf_selftest --dump log.txt    # reproduce fan_rf_dump's output
+//   /tmp/fan_rf_selftest --dump log.txt    # reproduce the dump_frames output
 //
 // No capture log is needed for the checks. The frame layer is already known
 // good against real captures, and the protocol is fully decoded in PROTOCOL.md,
@@ -77,8 +77,8 @@ static std::string to_bits(uint32_t value) {
 static void append_frame(std::vector<int32_t> &out, uint32_t code, int32_t skew) {
   for (int i = PACKET_BITS - 1; i >= 0; i--) {
     const bool one = (code >> i) & 1u;
-    const int32_t mark = (int32_t) (one ? frame::LONG_US : frame::SHORT_US) + skew;
-    const int32_t space = (int32_t) (one ? frame::SHORT_US : frame::LONG_US) - skew;
+    const int32_t mark = (int32_t) (one ? LONG_US : SHORT_US) + skew;
+    const int32_t space = (int32_t) (one ? SHORT_US : LONG_US) - skew;
     out.push_back(mark);
     out.push_back(-space);
   }
@@ -109,7 +109,7 @@ static std::vector<uint32_t> run_capture(PressTracker &tracker, const std::vecto
                                          uint32_t now_ms, Packet *last = nullptr,
                                          FrameWalk *walk_out = nullptr) {
   std::vector<uint32_t> events;
-  const FrameWalk walk = walk_frames(raw.data(), raw.size(), [&](uint16_t, uint32_t bits) {
+  const FrameWalk walk = walk_frames(raw.data(), raw.size(), [&](uint32_t bits) {
     const Packet p = decode_packet(bits);
     if (!p.valid())
       return;
@@ -215,6 +215,13 @@ static void check_validation() {
     if (decode_packet(good ^ (1u << bit)).valid())
       missed++;
   checkf(missed == 0, "all 32 single-bit corruptions rejected (%d slipped through)", missed);
+
+  {  // format_bits(), which is what the frame dump prints.
+    char buf[PACKET_BITS + 1];
+    format_bits(0xA1D8218F, buf);
+    check(std::string(buf) == "10100001110110000010000110001111", "format_bits is MSB first");
+    check(std::string(buf) == to_bits(0xA1D8218F), "format_bits agrees with the test helper");
+  }
 
   // The checksum alone must reject 15 of every 16 random payloads.
   int accepted = 0, total = 0;
@@ -473,22 +480,25 @@ static bool read_file(const std::string &path, std::string *out) {
   return true;
 }
 
-// Exactly what firmware/components/fan_rf_dump prints, through the same
-// walk_frames() the component calls.
+// Exactly what `dump_frames: true` prints, through the same walk_frames() the
+// component calls: one line per capture, comma-separated codewords.
 static void dump_capture(const Capture &capture) {
-  std::vector<std::pair<uint16_t, uint32_t>> found;
-  const FrameWalk walk =
-      walk_frames(capture.durations.data(), capture.durations.size(),
-                  [&](uint16_t position, uint32_t bits) { found.push_back({position, bits}); });
+  std::vector<uint32_t> found;
+  const FrameWalk walk = walk_frames(capture.durations.data(), capture.durations.size(),
+                                     [&](uint32_t bits) { found.push_back(bits); });
   if (found.empty())
     return;  // silent, the same as the component
 
-  printf("[%s][I][fan_rf_dump]: %u symbols, %u chunks, %u frames decoded\n",
-         capture.timestamp.c_str(), (unsigned) capture.durations.size(), (unsigned) walk.chunks,
-         (unsigned) walk.decoded);
-  for (const auto &entry : found)
-    printf("[%s][I][fan_rf_dump]:   f%u %s\n", capture.timestamp.c_str(), (unsigned) entry.first,
-           to_bits(entry.second).c_str());
+  std::string words;
+  for (size_t i = 0; i < found.size(); i++) {
+    if (i != 0)
+      words += ", ";
+    words += to_bits(found[i]);
+  }
+  printf("[%s][D][fan_rf]: %u symbols, %u chunk%s, %u frame%s: %s\n", capture.timestamp.c_str(),
+         (unsigned) capture.durations.size(), (unsigned) walk.chunks,
+         walk.chunks == 1 ? "" : "s", (unsigned) walk.decoded, walk.decoded == 1 ? "" : "s",
+         words.c_str());
 }
 
 static int replay(const std::vector<std::string> &paths) {
@@ -509,26 +519,24 @@ static int replay(const std::vector<std::string> &paths) {
     printf("\n=== %s: %zu captures ===\n", path.c_str(), captures.size());
     for (const Capture &capture : captures) {
       const uint32_t now = timestamp_ms(capture.timestamp);
-      walk_frames(capture.durations.data(), capture.durations.size(),
-                  [&](uint16_t position, uint32_t bits) {
-                    frames++;
-                    const Packet p = decode_packet(bits);
-                    if (!p.valid()) {
-                      rejected++;
-                      printf("%-13s f%-2u %s  REJECTED (%s%s)\n", capture.timestamp.c_str(),
-                             (unsigned) position, to_bits(bits).c_str(),
-                             p.prefix_ok ? "" : "bad prefix ", p.check_ok ? "" : "bad checksum");
-                      return;
-                    }
-                    const PressEvent e = tracker.feed(p.raw, now);
-                    if (!e.emit)
-                      return;
-                    keys[p.key]++;
-                    (e.repeat == 0 ? presses : repeats)++;
-                    printf("%-13s f%-2u %s  %-6s key=%2u (%s) counter=%u\n",
-                           capture.timestamp.c_str(), (unsigned) position, to_bits(bits).c_str(),
-                           e.repeat == 0 ? "PRESS" : "repeat", p.key, key_name(p.key), p.counter);
-                  });
+      walk_frames(capture.durations.data(), capture.durations.size(), [&](uint32_t bits) {
+        frames++;
+        const Packet p = decode_packet(bits);
+        if (!p.valid()) {
+          rejected++;
+          printf("%-13s %s  REJECTED (%s%s)\n", capture.timestamp.c_str(), to_bits(bits).c_str(),
+                 p.prefix_ok ? "" : "bad prefix ", p.check_ok ? "" : "bad checksum");
+          return;
+        }
+        const PressEvent e = tracker.feed(p.raw, now);
+        if (!e.emit)
+          return;
+        keys[p.key]++;
+        (e.repeat == 0 ? presses : repeats)++;
+        printf("%-13s %s  %-6s key=%2u (%s) counter=%u\n", capture.timestamp.c_str(),
+               to_bits(bits).c_str(), e.repeat == 0 ? "PRESS" : "repeat", p.key, key_name(p.key),
+               p.counter);
+      });
     }
   }
 

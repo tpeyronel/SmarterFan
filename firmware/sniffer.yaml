@@ -93,9 +93,10 @@ remote_receiver:
   # noise included, and at `idle: 4ms` noise fragments into ~2500 captures
   # across a session -- it buries the frames it was meant to reveal.
   #
-  # Nothing is lost day to day: `fan_rf_dump` below prints the decoded 32-bit
-  # words and stays silent when a capture yields nothing, which is what you
-  # actually want to read.
+  # This is the stage below `fan_rf`'s own `dump_frames`: the pulse durations
+  # that feed the decoder, rather than the words that come out of it. Nothing
+  # is lost day to day -- `dump_frames` prints the decoded 32-bit words and
+  # stays silent when a capture yields nothing, which is what you want to read.
   #
   # RE-ENABLE for a capture session. tools/decode_fan_rf.py and
   # tools/fan_rf_selftest.cpp both parse `Received Raw:` lines, so recording a
@@ -207,13 +208,13 @@ remote_receiver:
   # Verified offline across all 14 logs: 74 presses, 74/74 field checks, at
   # every idle from 12ms down to 1.5ms. The output does not change.
   #
-  # NOTE: raise this back to 12ms if you want `fan_rf_dump`'s frame-position
-  # numbering -- that view needs the whole burst in one capture.
+  # NOTE: raise this to 12ms if you want a whole burst on one `dump_frames`
+  # line. At 4ms each frame is its own capture, so each gets its own line.
   idle: 4ms
 
-  # Timing match slack. Neither `fan_rf` nor `fan_rf_dump` reads this -- they
-  # share one matching window, in fan_rf_dump_protocol.h -- but any other
-  # listener on this receiver would, so it is left where rc_switch had it.
+  # Timing match slack. `fan_rf` does not read this -- it carries its own
+  # matching window, in fan_rf_protocol.h -- but any other listener on this
+  # receiver would, so it is left where rc_switch had it.
   #
   # 25% was too tight and the sensors fired on 5 of 37 presses. The AGC does
   # not just settle in amplitude, it skews the duty cycle: in the first frame
@@ -263,7 +264,7 @@ external_components:
   - source:
       type: local
       path: components
-    components: [fan_rf, fan_rf_dump]
+    components: [fan_rf]
 
 fan_rf:
   id: fan_remote
@@ -290,6 +291,26 @@ fan_rf:
   # from the same hold continuing.
   run_timeout: 250ms
 
+  # Stage 1 out: one line per capture, listing every 32-bit word that decoded,
+  # exactly as it came off the wire and before any field is inspected. This is
+  # what says what the receiver actually delivered.
+  #
+  #   [D][fan_rf]: 65 symbols, 2 chunks, 1 frame: 10100001110110000010000111101001
+  #
+  # `idle` sits below the inter-frame gap, so a capture normally carries one
+  # frame; raise it to 12ms and a whole burst lands on one line. Silent on
+  # captures that decode nothing, which is nearly all of them.
+  #
+  # Off by default. Turn it on when a press is not being recognised and you
+  # need to see whether the frames arrived at all.
+  dump_frames: false
+
+  # Stage 3 out: the decoded presses and held repeats.
+  #
+  #   [D][fan_rf]: press  key= 3 (bright+) counter=6  0xA1D82169
+  #   [D][fan_rf]: repeat key= 3 (bright+) counter=6  0xA1D82169  #1
+  dump_commands: true
+
   # The useful primitive: fires with the key, the press counter, the raw 32-bit
   # code, and a repeat index that is 0 for the press itself and 1, 2, 3... for
   # each frame of a hold. Bind actions here.
@@ -297,29 +318,6 @@ fan_rf:
     - lambda: |-
         ESP_LOGI("remote", "key=%u counter=%u code=0x%08lX repeat=%lu",
                  key, counter, (unsigned long) code, (unsigned long) repeat);
-
-# DIAGNOSTIC — the plain view of what the receiver delivered.
-#
-# Prints every frame that decodes as 32 clean bits, as a binary word, and
-# nothing else: no ID check, no checksum, no vote, no dedupe. The only test is
-# whether the pulses match the remote's two symbol widths, applied
-# all-or-nothing per frame — so a corrupt frame prints nothing rather than a
-# half-guessed word.
-#
-# Frames are numbered with the preamble skipped, so a gap in the numbering is
-# the report that a frame was corrupt. Silent on captures that yield nothing,
-# which is most of them.
-#
-# Standalone — it needs `remote_receiver` and nothing else. It is also where the
-# frame decoder lives: `fan_rf` includes fan_rf_dump_protocol.h rather than
-# carrying a copy, and AUTO_LOADs this component for that header alone. That is
-# why both names appear in `external_components` above — AUTO_LOAD cannot import
-# a component that list leaves out — while the block below is what actually
-# creates a dumper. Delete the block and `fan_rf` still builds and runs. Costs
-# nothing to leave on: every listener sees every capture, so the two work from
-# the same data.
-fan_rf_dump:
-  id: fan_remote_dump
 
 # Named buttons, built on the same decode. `key` takes any name from the table
 # in PROTOCOL.md section 4 — bright_up, bright_down, colour_temp_up,
