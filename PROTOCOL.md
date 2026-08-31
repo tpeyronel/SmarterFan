@@ -76,9 +76,13 @@ nibbles of the word.
 
 ## 2. Transmission behaviour
 
-* Each press sends the same frame **3–5 times** (4 is typical), repeat interval
-  roughly **33–56 ms**, so a burst lasts ~30–200 ms.
-* All repeats within a burst are bit-identical (same `KEY` *and* same `CNT`).
+* Each press sends the same frame **exactly 5 times**. A burst that decodes as fewer than 5 frames means the decoder lost
+  some to noise, not that the remote sent fewer.
+* **Holding the button down** keeps the burst going: the remote repeats the *original*
+  frame indefinitely, with `CNT` unchanged, until the button is released. A hold is
+  therefore just a burst longer than 5 frames — there is no separate repeat code and
+  no way to distinguish a hold from a long burst other than by its length.
+* All repeats, held or not, are bit-identical (same `KEY` *and* same `CNT`).
 * No rolling code, no encryption, no per-frame nonce. The only state is the 3-bit
   counter.
 
