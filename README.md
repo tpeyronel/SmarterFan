@@ -114,6 +114,10 @@ R = (3.3 − 1.12) / 0.00336 ≈ 650 Ω  →  620 Ω
 
 The MCU keeps driving its now-disconnected pins. Harmless.
 
+Both pads then carry `ledc` PWM at **1 kHz**, the frequency the OEM MCU runs, and the two channels are one `cwww` light in ESPHome — brightness on one axis, the mix between the channels on the other. The mix is normalised by the larger of the two fractions, so the middle of the colour temperature range is *both* channels at full rather than each at half, and 100% brightness there is the full 56 W. The consequence is deliberate and visible: total output is not constant as the colour temperature sweeps, it roughly doubles toward the middle. That is what being able to reach full output costs.
+
+`firmware/relay.yaml` is the config, and its `substitutions:` block at the top is every value that bring-up has to settle. **None of this has met hardware** — see [LED bring-up](#led-bring-up).
+
 ### 2. RF — relay through the ESP32
 
 Remove the `102` resistor between the RF receiver's output and the MCU's input. The ESP32 then sits in the middle:
@@ -276,7 +280,7 @@ Two ESPHome builds, both loading local components out of `firmware/components`:
 | Build | Needs | Does |
 |---|---|---|
 | `firmware/sniffer.yaml` | just the sniff tap — **no board modification** | Decodes the remote and prints it. This is the bring-up config and it stays receive-only. |
-| `firmware/relay.yaml` | the `102` removed and a shifter on both lines | The same decode, plus injection into the OEM MCU's RF input and a `fan_rf.send_key` action for Home Assistant. |
+| `firmware/relay.yaml` | **both** modifications: the `102` removed with a shifter on both lines, *and* `R37`/`R38` removed | The same decode, plus injection into the OEM MCU's RF input and a `fan_rf.send_key` action for Home Assistant, plus the two LED channels as a `cwww` light driven from the remote's six light keys. `relay: fan` and the `R37`/`R38` removal are one change — with the resistors still fitted, the light has nothing driving it. |
 
 | Component | Does |
 |---|---|
@@ -518,7 +522,8 @@ Use RMT for the OOK rather than bit-banging. Once you do, the C3's single core i
 
 - **The RF data line carries continuous noise when idle.** The receiver's AGC ramps to full gain with no transmitter present, so its output is amplified band noise. Decode with sync-word and pulse-timing validation, never edge counting. Real packets have quantised pulse widths; noise does not.
 - **The dimming floor is set by the PC817, not by PWM resolution.** The optocoupler cannot pass arbitrarily narrow pulses, so the practical minimum duty is where pulse width exceeds roughly 10–20 µs. 12-bit resolution already exceeds what the opto can use — don't chase bits.
-- **Consider lowering the dim PWM frequency.** If the OEM runs it fast, narrow low-duty pulses may be getting swallowed by the optocoupler — which would mean the stock brightness floor is an optocoupler artefact. Sweep frequency and duty and find out. Stay above ~1 kHz to avoid stroboscopic beating against the blades.
+- **The dim PWM frequency and the minimum duty move together.** 1 kHz is what the OEM runs and what this firmware uses. Raising it for strobe margin shortens the pulse at a given duty — 1% at 2 kHz is 5 µs, below anything the PC817 is expected to pass — so `min_power` has to rise with it. Lowering it buys pulse width and costs flicker margin, with a floor around ~1 kHz to avoid stroboscopic beating against the blades. 1 kHz is where those two constraints meet, which is presumably why the OEM chose it.
+- **The OEM's brightness floor is probably not an optocoupler artefact — but that is not settled.** The hypothesis was that a *fast* OEM PWM might be getting its narrow low-duty pulses swallowed by the opto, making the stock floor analogue rather than firmware. At 1 kHz the OEM's PWM is not fast, so that explanation is now unlikely. It is not disproven: the OEM's *minimum duty* is still unmeasured, and if it is low enough the pulses are narrow whatever the frequency. Measuring it is one line of the bring-up below.
 - **Watchdog the relay path.** It is the only route from the remote to the fan once the `102` is removed.
 
 ---
@@ -528,6 +533,8 @@ Use RMT for the OOK rather than bit-banging. Once you do, the C3's single core i
 No custom app. Two standard integrations:
 
 **Home Assistant** — the primary interface. A `light` entity with brightness and colour temperature, a `fan` entity with the six OEM speeds, and HA automations for the sunrise alarm. If firmware lands on ESPHome this is essentially free.
+
+The colour temperature slider is one-dimensional and normalised, so it cannot express every pair of channel levels — "warm at 100%, cool at 40%" is not a point on it. `light.control` with explicit `cold_white:` and `warm_white:` values still reaches those, from an automation or the API. One entity is the right number; a second one for the raw channels would be two lights fighting over the same hardware.
 
 **Matter** — expose the same fan and light so Apple Home, Google Home and Alexa can drive them without going through HA. Note the C3 is Wi-Fi only, so this is Matter-over-Wi-Fi; Thread would need a C6 or H2.
 
@@ -543,6 +550,7 @@ Honesty about what is actually known, since someone may try to rebuild this.
 
 - `R37`, `R38` = 1 kΩ, MCU → two optocouplers
 - MCU output high = 4.48 V; post-resistor = 1.12 V; drive current = 3.36 mA
+- **OEM dimming PWM frequency = 1 kHz**, a 1 ms period. The duty range it sweeps is *not* measured — see below
 - RF receiver SOP-8 output → 1 kΩ → MCU input
 - Continuous activity on the RF data line with no button pressed
 - Remote wire format, frame layout, checksum and the full 20-button key table — see [PROTOCOL.md](PROTOCOL.md). Every button on the remote captured and decoded, all field checks passing
@@ -561,7 +569,10 @@ Honesty about what is actually known, since someone may try to rebuild this.
 
 - [ ] **Low-voltage DC bus voltage.** Everything about the buck depends on it. Nothing in this repo has measured it.
 - [ ] LED channel forward voltage and current, per channel
-- [ ] OEM dimming PWM frequency and duty range
+- [ ] **OEM dimming duty range.** The frequency is 1 kHz; the minimum and maximum duty it sweeps between are not known, and the minimum is what would say whether the stock brightness floor is analogue or firmware
+- [ ] **Which of `R37`/`R38` is the warm channel.** GPIO 7 goes to `R37` and GPIO 10 to `R38`, but nothing says which LED driver is which colour
+- [ ] **Which way the dimming optocouplers go.** Whether more current through the PC817 means brighter or dimmer at the `MT9722S` dim input
+- [ ] **The usable minimum duty through the optocouplers.** The configured 1% is a starting point, not a measurement
 - [ ] Whether a pull-down exists on the MCU's RF input pin. If one does, it fights the shifter's 10 kΩ pull-up and the high level will not clear V<sub>IH</sub> — use a push-pull `74HCT1G34` instead.
 - [ ] `4614` pinout
 - [ ] Third optocoupler's actual function
@@ -578,6 +589,36 @@ Measure the MCU RF input pin.
 ```
 
 Then capture a real packet off the receiver output, replay yours, and overlay the two traces. Matching timings and a clean 0.7 V → 4.48 V swing means the MCU will accept it.
+
+### LED bring-up
+
+Nothing in the LED path has been tested. Two facts the config has to guess — which pad is the warm channel, and which way the optocouplers go — are both answerable *before* removing anything, by watching the stock MCU do the job. Do that first.
+
+Probe the **MCU side** of `R37` and `R38` only. That node is on the low-voltage secondary; the other side of the optocoupler is mains-referenced, and the [Safety](#️-safety) rules apply to it in full.
+
+**1. Watch the OEM drive both pads.** Scope both, run the fan on mains, and step the remote through its brightness range.
+
+- Confirm the 1 kHz. Then record the duty at each OEM step, and specifically **the lowest duty it ever uses.** If that is down at ~10 µs the optocoupler is the limit and the stock brightness floor is analogue; if it is tens of percent, the floor is firmware and there is room below it. This is the one measurement that settles the question, and it is gone once the resistors are out.
+- **Duty rising with brightness means more current is brighter** → `led_inverted: "false"` in `firmware/relay.yaml`. Duty falling with brightness → `"true"`.
+
+**2. Identify the warm channel.** Same setup: press `temp -` to the warmest tone and see which of the two pads carries the higher duty, then `temp +` to check it moves back. The pad that rises going warm is the warm channel. The config ships `cold_white: led_r38` / `warm_white: led_r37`; if it is `R38` that goes warm, swap those two ids and change nothing else.
+
+**3. Cut and wire.** Remove `R37` and `R38`, then 620 Ω from GPIO 7 to `R37`'s opto-side pad and 620 Ω from GPIO 10 to `R38`'s. Flash `firmware/relay.yaml`. It ships `relay: fan`, which is only correct once this step is done.
+
+**4. First light.** Set the light to 100% brightness and the middle of the colour temperature slider — both channels should be at full duty and the fixture at its full 56 W. Then:
+
+- Bright at the bottom of the slider and dark at the top means the polarity guess is backwards: flip `led_inverted`.
+- Cool where Home Assistant says warm means the channels are swapped: swap the two ids in the `cwww` block.
+- One channel dead is wiring, not config — check that pad's duty on the scope before touching the YAML.
+
+**5. Find where the light stops responding.** Drive the slider to each end first: at fully warm the cool channel is commanded to exactly zero, so `zero_means_zero` should hold it dark and each channel can be measured on its own.
+
+Then sweep brightness down and watch the LED and the duty together. Two things compress the bottom of that sweep and both are expected:
+
+- `min_power` is 1%, a 10 µs pulse at 1 kHz, against a PC817 whose practical minimum is roughly 10–20 µs. That is the bottom edge of the range, not inside it.
+- With the default `gamma_correct: 2.8`, a brightness of 19% already gamma-corrects to 1% — so everything below about a fifth of the slider is pinned at `min_power`, and the whole bottom of the travel lives between roughly 10 and 12 µs.
+
+Note the brightness at which the LED stops getting dimmer, and the brightness at which it drops out or starts flickering. Then raise `min_power_r37` and `min_power_r38` — independently; they are separate parts — to the lowest duty that channel passes cleanly. If the answer is well above 1%, dropping the PWM frequency buys pulse width at the same duty, down to the ~1 kHz floor set by strobing against the blades. Check that last point with the fan actually running.
 
 ---
 
@@ -609,7 +650,9 @@ There is also a mechanical limit that no controller can beat. Blade deployment i
 
 The remote is fully solved — wire format, frame layout, checksum and all 20 buttons, documented in [PROTOCOL.md](PROTOCOL.md) and decoded on-device by `fan_rf`, which identifies every button and distinguishes a tap from a hold.
 
-The RF path is now written in both directions. `firmware/relay.yaml` builds, reconstructs frames and injects them on GPIO 5, and exposes `fan_rf.send_key` to Home Assistant; the round trip is checked on the host by feeding what the transmitter emits back through the decoder. **None of it has met the board** — there is no modified board and nothing has been on a scope. What remains on the RF side is confirming that against hardware; everything else is hardware work and the LED path.
+The RF path is written in both directions. `firmware/relay.yaml` builds, reconstructs frames and injects them on GPIO 5, and exposes `fan_rf.send_key` to Home Assistant; the round trip is checked on the host by feeding what the transmitter emits back through the decoder.
+
+The LED path is written too: two `ledc` outputs into a `cwww` light, the six light keys bound to it, and `relay: fan` so those keys no longer reach the MCU. **None of it has met the board.** `R37` and `R38` are still fitted, no optocoupler has been driven from the ESP32, and no LED has been lit from this firmware — so every value in the config's `substitutions:` block is a guess, including which channel is warm and which way the optocouplers go. [LED bring-up](#led-bring-up) is the procedure for settling them; everything else on this side is hardware work.
 
 ## License
 

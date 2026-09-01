@@ -1,17 +1,60 @@
-# SmarterFan — milestone 1: RF relay
+# SmarterFan — milestone 2: RF relay + LED dimming
 #
 # Decodes the remote off the OEM receiver's output pad (GPIO6) and injects
-# reconstructed commands into the OEM MCU's RF input (GPIO5), so every button
-# still works while the ESP32 sits in the middle of the path.
+# reconstructed commands into the OEM MCU's RF input (GPIO5), so every fan
+# button still works while the ESP32 sits in the middle of the path. The six
+# light keys stop here instead: the ESP32 drives the two dimming optocouplers
+# itself (GPIO7, GPIO10) and the light is one CWWW entity in Home Assistant.
 #
-# REQUIRES THE BOARD MODIFIED — the `102` between the RF receiver output and
-# the MCU input removed, and a level shifter on both lines. See README.md.
-# firmware/sniffer.yaml is the read-only build and needs no modification.
+# REQUIRES THE BOARD MODIFIED, both modifications:
+#   - the `102` between the RF receiver output and the MCU input removed, and a
+#     level shifter on both lines;
+#   - `R37` and `R38` removed, and a 620 Ohm from each of GPIO7 and GPIO10 to
+#     the opto-side pad each one leaves floating.
+# See README.md. firmware/sniffer.yaml is the read-only build and needs
+# neither.
 #
 # Injecting on GPIO5 BEFORE the 102 is removed is not destructive: the ESP32
 # and the OEM receiver then both drive the MCU input through a 1 kOhm and the
 # two fight through 2 kOhm. It is also not a useful test, because whichever
 # source is asserting low wins and the MCU sees a mixture of the two.
+
+# --- bring-up knobs --------------------------------------------------------
+# Nothing below has met hardware. The LED bring-up procedure in README.md is
+# how each one gets settled.
+substitutions:
+  # Optocoupler polarity, UNVERIFIED: nobody has established whether more
+  # current through the PC817 means brighter or dimmer at the MT9722S dim
+  # input. `false` = more duty is brighter. Flip to `true` if the light comes
+  # up brightest with the slider at the bottom. Both channels are wired the
+  # same way, so both move together.
+  led_inverted: "false"
+
+  # The duty a channel sits at when it is on but asked for the least possible.
+  # At 1 kHz, 1% is a 10 us pulse and the PC817's practical minimum is roughly
+  # 10-20 us, so this is on the bottom edge of what the opto is expected to
+  # pass rather than comfortably inside it: a value to measure from, not a
+  # validated one. Per channel, because the two optocouplers are separate parts
+  # and need not share a floor.
+  min_power_r37: "1%"
+  min_power_r38: "1%"
+
+  # One step of a brightness button. A held button pulses once per frame,
+  # 41.1 ms apart, so 2% sweeps the whole range in 50 steps, ~2.1 s. A tap is
+  # one step of the same size -- the remote has no way to say otherwise, and
+  # that is how the OEM behaves.
+  dim_step: "2%"
+
+  # ...and the floor a hold stops at. light.dim_relative switches the light off
+  # when it arrives at zero, so without this, holding `bright -` would end with
+  # the light off rather than at its dimmest. `light on/off` and `all off` are
+  # the buttons for turning it off.
+  dim_floor: "1%"
+
+  # One step of a colour temperature button, as a fraction of the light's
+  # mireds range, so the sweep stays ~2 s whatever the Kelvin endpoints below
+  # are corrected to.
+  ct_step: "0.02"
 
 esphome:
   name: smarterfan-relay
@@ -118,11 +161,15 @@ fan_rf:
   #   [D][fan_rf]: inject key=18 (fan 2) counter=1  0xA1D82919  1x +preamble
   dump_commands: true
 
-  # Everything is forwarded for now. `fan` drops the six light keys and keeps
-  # the rest, including the five whose side of the fan has never been verified
-  # — that is the setting for once the ESP32 drives the LEDs itself, which does
-  # not exist yet.
-  relay: all
+  # The six light keys stop here now that the ESP32 drives the LEDs. Everything
+  # else is forwarded, including the five keys whose side of the fan has never
+  # been verified.
+  #
+  # THIS SETTING AND THE R37/R38 REMOVAL ARE ONE CHANGE. Until those resistors
+  # are out, the ESP32 is not connected to the optocouplers and `fan` leaves
+  # the light with nothing driving it: the MCU stops hearing the light keys and
+  # the PWM on GPIO7/GPIO10 goes nowhere. Run `all` until the board is cut.
+  relay: fan
 
   # How long a press waits before it counts as a tap. Pure added latency on
   # every tap, and it cannot go below press_frames x 41.1 ms = 205 ms, which is
@@ -135,21 +182,188 @@ fan_rf:
   # remote_transmitter's rmt_symbols with it.
   tap_frames: 1
 
-# Named buttons, for automations that should act on the remote rather than just
-# pass it through. Everything here is still relayed to the MCU as well.
+# --- LED dimming: the two optocouplers -------------------------------------
+# Each GPIO drives a PC817 through 620 Ohm into the pad `R37`/`R38` left
+# floating by the modification. Named after the pad rather than the colour,
+# because which pad is which colour is not known -- see the light below.
+#
+# 1 kHz is the OEM MCU's own dimming frequency, measured on the stock board,
+# and also ledc's default; it is written out because min_power depends on it.
+# Raising it shortens the pulse at a given duty -- 1% at 2 kHz is 5 us, below
+# anything the optocoupler is expected to pass -- so min_power has to rise with
+# it. Lowering it buys pulse width and costs flicker margin against the blades.
+output:
+  - platform: ledc
+    id: led_r37
+    pin: GPIO7
+    frequency: 1kHz
+    min_power: ${min_power_r37}
+    # Mandatory next to min_power, not a refinement of it. The mix commands one
+    # channel to exactly zero at either end of the colour temperature range,
+    # and without this that channel would still emit min_power -- a faint cool
+    # glow across a "fully warm" setting that never goes away.
+    zero_means_zero: true
+    inverted: ${led_inverted}
+
+  - platform: ledc
+    id: led_r38
+    pin: GPIO10
+    frequency: 1kHz
+    min_power: ${min_power_r38}
+    zero_means_zero: true
+    inverted: ${led_inverted}
+
+light:
+  - platform: cwww
+    id: led_light
+    name: "Light"
+
+    # WHICH PAD IS THE WARM CHANNEL IS UNVERIFIED. The README pins GPIO7 to
+    # R37 and GPIO10 to R38; nothing says which driver is which colour. If the
+    # light runs cold where Home Assistant says warm, swap these two ids and
+    # change nothing else.
+    cold_white: led_r38
+    warm_white: led_r37
+
+    # Guesses -- nothing has measured either channel. These set the ends of the
+    # Home Assistant slider and the Kelvin it is labelled with; the mix
+    # normalises whatever range they describe, so the hardware does exactly the
+    # same thing whatever numbers go here.
+    cold_white_color_temperature: 6500K
+    warm_white_color_temperature: 2700K
+
+    # The default, stated because it is load-bearing. Each channel's duty is
+    # brightness x its fraction, and the two fractions are normalised by the
+    # larger of them: in the middle of the range both come out at 1.0, so at
+    # 100% brightness both LEDs are at full. The price is that total output is
+    # not constant as the slider sweeps -- it roughly doubles toward the middle
+    # -- which is visible, and is what being able to reach full output costs.
+    constant_brightness: false
+
+    # A held button delivers 24 steps a second and the default is 1s, so this
+    # would otherwise be 24 overlapping one-second fades. Automations that want
+    # a fade -- the sunrise alarm -- pass their own transition_length.
+    default_transition_length: 0s
+
+    # Brightness, mix and on/off all come back after a restart. This does mean
+    # the light turns itself on when a blackout ends.
+    restore_mode: RESTORE_DEFAULT_OFF
+
+# ESPHome has light.dim_relative but no colour temperature equivalent, and this
+# script is the whole of that gap.
+script:
+  - id: colour_temp_step
+    parameters:
+      # Signed fraction of the light's mireds range; positive is warmer.
+      delta: float
+    then:
+      # control, not turn_on: pressing temp+ on a light that is off adjusts the
+      # mix it will come back at instead of switching it on.
+      - light.control:
+          id: led_light
+          color_temperature: !lambda |-
+            auto traits = id(led_light).get_traits();
+            const float lo = traits.get_min_mireds();
+            const float hi = traits.get_max_mireds();
+            float cur = id(led_light).remote_values.get_color_temperature();
+            // Zero until something sets a colour temperature -- a first boot
+            // with nothing restored. Start such a press from the middle.
+            if (cur < lo || cur > hi)
+              cur = (lo + hi) / 2.0f;
+            return clamp(cur + delta * (hi - lo), lo, hi);
+
+# The remote's light keys, acted on here rather than passed to the MCU, since
+# `relay: fan` above drops all six. `repeats` is left on where holding should
+# ramp and turned off where a hold should register once.
 binary_sensor:
   - platform: fan_rf
     name: "Remote: brightness up"
     key: bright_up
+    on_press:
+      - light.dim_relative:
+          id: led_light
+          relative_brightness: ${dim_step}
+          brightness_limits:
+            min_brightness: ${dim_floor}
+            max_brightness: 100%
 
+  # Either brightness button wakes a light that is off, at the bottom of its
+  # range -- dim_relative works off state x brightness, so an off light reads
+  # as zero and the clamp brings it back up to the floor.
   - platform: fan_rf
     name: "Remote: brightness down"
     key: bright_down
+    on_press:
+      - light.dim_relative:
+          id: led_light
+          relative_brightness: -${dim_step}
+          brightness_limits:
+            min_brightness: ${dim_floor}
+            max_brightness: 100%
+
+  # temp+ raises the colour temperature in Kelvin, i.e. towards cooler, which
+  # is a fall in mireds -- hence the negative delta. Which way the OEM's two
+  # buttons actually go has never been observed; swapping these two signs is
+  # the whole change if this is backwards.
+  - platform: fan_rf
+    name: "Remote: colour temperature up"
+    key: colour_temp_up
+    on_press:
+      - script.execute:
+          id: colour_temp_step
+          delta: -${ct_step}
+
+  - platform: fan_rf
+    name: "Remote: colour temperature down"
+    key: colour_temp_down
+    on_press:
+      - script.execute:
+          id: colour_temp_step
+          delta: ${ct_step}
 
   - platform: fan_rf
     name: "Remote: light toggle"
     key: light_toggle
     repeats: false
+    on_press:
+      - light.toggle: led_light
+
+  - platform: fan_rf
+    name: "Remote: full brightness"
+    key: cycle_full_bright
+    repeats: false
+    on_press:
+      - light.turn_on:
+          id: led_light
+          brightness: 100%
+          # The middle of the range: both fractions are 0.5, both normalise to
+          # 1.0, both LEDs end up at full.
+          color_temperature: !lambda |-
+            auto traits = id(led_light).get_traits();
+            return (traits.get_min_mireds() + traits.get_max_mireds()) / 2.0f;
+
+  # Reaches the MCU as well: `night mode` is one of the five UNVERIFIED keys,
+  # so `relay: fan` forwards it and nobody knows what the MCU does with it. If
+  # it turns out to touch only the light, it belongs in key_domain()'s light
+  # group and this relay will stop.
+  - platform: fan_rf
+    name: "Remote: night mode"
+    key: night_mode
+    repeats: false
+    on_press:
+      - light.turn_on:
+          id: led_light
+          brightness: ${dim_floor}
+          color_temperature: !lambda |-
+            return id(led_light).get_traits().get_max_mireds();
+
+  # Also still relayed, and here that is the intent -- it stops the fan too.
+  - platform: fan_rf
+    name: "Remote: all off"
+    key: all_off
+    repeats: false
+    on_press:
+      - light.turn_off: led_light
 
 # Commands originated here rather than relayed. `key` takes any name from the
 # table in PROTOCOL.md section 4, or a raw 0-31 value, and can be templated.
