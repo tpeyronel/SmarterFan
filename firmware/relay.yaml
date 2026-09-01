@@ -39,6 +39,14 @@ substitutions:
   min_power_r37: "1%"
   min_power_r38: "1%"
 
+  # PWM frequency, both channels. 1 kHz is what the OEM MCU runs and is where
+  # ledc defaults. It is a knob because it and min_power move together: what
+  # reaches the driver's dim input is a pulse of min_power / frequency, and the
+  # MT9722S is a constant-current part whose floor may well be a minimum pulse
+  # width rather than a minimum duty. Keep it clear of 100 Hz and its harmonics
+  # -- the LED current already carries a mains-rate ripple to beat against.
+  pwm_frequency: "0.25kHz"
+
   # One step of a brightness button. A held button pulses once per frame,
   # 41.1 ms apart, so 2% sweeps the whole range in 50 steps, ~2.1 s. A tap is
   # one step of the same size -- the remote has no way to say otherwise, and
@@ -187,16 +195,14 @@ fan_rf:
 # floating by the modification. Named after the pad rather than the colour,
 # because which pad is which colour is not known -- see the light below.
 #
-# 1 kHz is the OEM MCU's own dimming frequency, measured on the stock board,
-# and also ledc's default; it is written out because min_power depends on it.
-# Raising it shortens the pulse at a given duty -- 1% at 2 kHz is 5 us, below
-# anything the optocoupler is expected to pass -- so min_power has to rise with
-# it. Lowering it buys pulse width and costs flicker margin against the blades.
+# Frequency and min_power are one setting in two halves -- what the opto sees
+# is a pulse width, min_power / frequency -- so both live in the substitutions
+# above and neither moves alone.
 output:
   - platform: ledc
     id: led_r37
     pin: GPIO7
-    frequency: 1kHz
+    frequency: ${pwm_frequency}
     min_power: ${min_power_r37}
     # Mandatory next to min_power, not a refinement of it. The mix commands one
     # channel to exactly zero at either end of the colour temperature range,
@@ -208,7 +214,7 @@ output:
   - platform: ledc
     id: led_r38
     pin: GPIO10
-    frequency: 1kHz
+    frequency: ${pwm_frequency}
     min_power: ${min_power_r38}
     zero_means_zero: true
     inverted: ${led_inverted}
