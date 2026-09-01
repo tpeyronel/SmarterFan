@@ -73,7 +73,7 @@ logger:
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
-  output_power: 8.5db
+  output_power: 12db
   ap:
     ssid: "SmarterFan Setup"
     password: !secret ap_password
