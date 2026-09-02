@@ -220,11 +220,11 @@ inject:   .   .   .   .   . F                tapped — starts at the deadline
 
 ### Dimming
 
-The `MT9722S` **gates rather than averages** its dim input — measured, since the PWM becomes visible as flicker below ~250 Hz. That is the good case: average light tracks duty, and what stops it is a minimum pulse *width*, not a minimum duty. So the lowest usable duty is `t_min × frequency`, which makes **frequency the dimming-depth knob and lower dimmer** — the opposite of the usual instinct. Dropping the carrier from the OEM's 1 kHz to 250 Hz makes the same pulse a quarter of the duty.
+The `MT9722S` **gates rather than averages** its dim input — measured, since the PWM becomes visible as flicker below ~250 Hz. That is the good case: average light tracks duty, and what stops it is a minimum pulse *width*, not a minimum duty. So the lowest usable duty is `t_min × frequency`, which makes **frequency the dimming-depth knob and lower dimmer** — the opposite of the usual instinct. Dropping the carrier from the OEM's 1 kHz to 250 Hz makes the same pulse a quarter of the duty. `t_min` is [measured at just under 3.9 µs](#confirmed-on-hardware), which is what puts `min_power` at 0.1% here.
 
 What bounds the frequency from below: **visible flicker**, measured at ~250 Hz; **beating against the 100 Hz mains ripple** already on the LED current (CE5/CE6 are 2.2 µF feeding ~28 W a channel — nowhere near enough hold-up), so sit between harmonics rather than on one; and **stroboscopic beating against the blades**, per fan speed, [not yet checked](#still-open). 250 Hz sits exactly on the measured flicker floor and clears the harmonics by 50 Hz either side, but has no margin. The next stop up is ~350 Hz, at the cost of 40% more minimum duty.
 
-The OEM's floor was a firmware choice, not an optocoupler artefact: 1 kHz is not fast, and its dimmest step was 7.4% duty — a 74 µs pulse, far above the ~10–20 µs where the PC817 struggles.
+The OEM's floor was a firmware choice, not an optocoupler artefact: 1 kHz is not fast, and its dimmest step was 7.4% duty — a 74 µs pulse, nearly twenty times the shortest one the PC817 turns out to still pass.
 
 ### Host tooling
 
@@ -261,7 +261,8 @@ Three properties shape everything else:
 
 ### Confirmed on hardware
 
-- **The LED path works.** `R37`/`R38` out, 620 Ω from GPIO 7 and GPIO 10, 250 Hz, `min_power: 1%` — and the light dims far below the OEM minimum, which was the point of the project. A 40 µs pulse against the OEM's dimmest 74 µs at four times the repetition rate.
+- **The LED path works.** `R37`/`R38` out, 620 Ω from GPIO 7 and GPIO 10, 250 Hz, `min_power: 0.1%` — and the light dims far below the OEM minimum, which was the point of the project. A 3.9 µs pulse against the OEM's dimmest 74 µs at four times the repetition rate: **0.098% duty against 7.4%, a 75× lower floor.**
+- **`t_min` is between 2.7 µs and 3.9 µs, and the PC817 imposes it, not the `MT9722S`.** Swept `min_power` down at 250 Hz: 0.1% — a 3.9 µs pulse — still lights both channels, and 0.07% (2.7 µs) goes dark rather than dimmer. `min_power_r37`/`_r38` are both **0.1%**, on the floor rather than above it. Nearly the whole range is in the last step: 1% down to 0.2% barely changes, then 0.2% → 0.1% does almost all the dimming — the signature of a switching-time limit rather than a duty one. Being a pulse width, it scales with the carrier, so what is left of the dimming range lives in `pwm_frequency`, and [flicker](#dimming) is what caps that.
 - **The RF relay works in both directions.** The remote's light keys reach the decoder and drive the light; its fan keys are reconstructed and injected into the OEM MCU, which accepts them.
 - Optocouplers are non-inverting from the ESP32's side (`led_inverted: "false"`); **`R38`/GPIO 10 is cold, `R37`/GPIO 7 is warm**.
 - **An occasional flicker at any brightness was the ESP32 rebooting itself**, not the analogue path — `api:` and `wifi:` both default to `reboot_timeout: 15min`. See [Two defaults that reboot the fan](#two-defaults-that-reboot-the-fan).
@@ -278,7 +279,6 @@ Three properties shape everything else:
 
 ### Still open
 
-- [ ] **`t_min`, the minimum pulse width the dim chain responds to.** Bracketed between 10 µs and 40 µs — worth up to another 4× of dimming range at 250 Hz. 1% is a 40 µs pulse and produces plenty of light, so sweep `min_power` down from there — 0.5%, 0.3%, 0.2% — and find where the light stops getting dimmer; `min_power_r37`/`_r38` then belong just above it, and need not match. Which part imposes it, the PC817 or the `MT9722S`, is a second question.
 - [ ] **Stroboscopic beating between the 250 Hz dim PWM and the blades**, at each of the six fan speeds. The one thing that could force the carrier back up.
 - [ ] **Whether 250 Hz is flicker-free for other people.** It is the measured threshold, not a value with margin.
 - [ ] **How far the 24 V bus rises when the motor decelerates.** The MP1584 is a 28 V part with a 30 V absolute maximum, so the headroom is ~4 V and the failure mode is not graceful — see [Power](#power). Scope the bus across a 6→off transition at the buck's input.
