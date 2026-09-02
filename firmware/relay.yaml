@@ -39,12 +39,16 @@ substitutions:
   min_power_r37: "1%"
   min_power_r38: "1%"
 
-  # PWM frequency, both channels. 1 kHz is what the OEM MCU runs and is where
-  # ledc defaults. It is a knob because it and min_power move together: what
-  # reaches the driver's dim input is a pulse of min_power / frequency, and the
-  # MT9722S is a constant-current part whose floor may well be a minimum pulse
-  # width rather than a minimum duty. Keep it clear of 100 Hz and its harmonics
-  # -- the LED current already carries a mains-rate ripple to beat against.
+  # PWM frequency, both channels, and the knob that decides how dim the light
+  # can get. The MT9722S gates its output rather than averaging the dim input,
+  # so the lowest usable duty is the driver's minimum pulse width times this
+  # frequency: a lower carrier is a dimmer minimum, which is the opposite of
+  # the usual instinct. Three things bound it from below -- flicker, visible
+  # under ~250 Hz; beating against the 100 Hz mains ripple already on the LED
+  # current, so sit between harmonics and not on one; and blade strobing, which
+  # is per fan speed and HAS NOT BEEN CHECKED. This sits exactly on the
+  # measured flicker floor, with no margin for that last one. The OEM ran
+  # 1 kHz, and its dimmest step was 7.4% duty.
   pwm_frequency: "0.25kHz"
 
   # One step of a brightness button. A held button pulses once per frame,
@@ -97,6 +101,15 @@ api:
 ota:
   - platform: esphome
     password: !secret ota_password
+
+# A control page served by the device itself, at http://smarterfan-relay.local/
+# -- every entity below with a control for it, no server anywhere. This is the
+# whole interface if Home Assistant is never set up; if it is, the two coexist.
+#
+# Unauthenticated, so anything on the LAN can drive the light. `auth:` with a
+# username and password is the knob if that is not wanted.
+web_server:
+  port: 80
 
 external_components:
   - source:
@@ -189,6 +202,31 @@ fan_rf:
   # goes over a wire. Raise it if one turns out not to be enough — and raise
   # remote_transmitter's rmt_symbols with it.
   tap_frames: 1
+
+# Diagnostics. An ESP32 reset takes the GPIOs high-Z, which drops the drive to
+# both optocouplers -- indistinguishable from a brief flicker if the reboot is
+# quick. Uptime resetting to zero, or a reset_reason other than a clean power-on,
+# is what separates that from anything happening in the analogue path. Remove
+# once the flicker question is closed.
+debug:
+  update_interval: 30s
+
+text_sensor:
+  - platform: debug
+    reset_reason:
+      name: "Reset reason"
+
+sensor:
+  - platform: uptime
+    name: "Uptime"
+    update_interval: 30s
+
+  # Wi-Fi TX bursts to ~350 mA on the C3, and the drive to both optocouplers
+  # comes off the same 3V3 rail. If flickers cluster with radio activity, the
+  # bulk capacitance on that rail is the first suspect.
+  - platform: wifi_signal
+    name: "WiFi signal"
+    update_interval: 60s
 
 # --- LED dimming: the two optocouplers -------------------------------------
 # Each GPIO drives a PC817 through 620 Ohm into the pad `R37`/`R38` left
@@ -374,6 +412,21 @@ binary_sensor:
 # Commands originated here rather than relayed. `key` takes any name from the
 # table in PROTOCOL.md section 4, or a raw 0-31 value, and can be templated.
 button:
+  # Diagnostic for the occasional flicker. The radio is the largest current
+  # step on the 3V3 rail the optocoupler drive shares, so taking it away for a
+  # while is the cleanest way to ask whether it is the aggressor. The remote
+  # keeps working throughout -- the decode path is RMT and never touches the
+  # network stack -- so the light stays usable with nothing on the air.
+  #
+  # It re-enables itself, and a crash reboots with the radio on, so there is no
+  # way for this to strand the board.
+  - platform: template
+    name: "Diagnostic: radio off 30 min"
+    on_press:
+      - wifi.disable:
+      - delay: 30min
+      - wifi.enable:
+
   - platform: template
     name: "Fan: off"
     on_press:
