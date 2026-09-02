@@ -182,9 +182,10 @@ fan_rf:
   #   [D][fan_rf]: inject key=18 (fan 2) counter=1  0xA1D82919  1x +preamble
   dump_commands: true
 
-  # The six light keys stop here now that the ESP32 drives the LEDs. Everything
-  # else is forwarded, including the five keys whose side of the fan has never
-  # been verified.
+  # The seven light keys stop here now that the ESP32 drives the LEDs, and so
+  # do `natural wind`, `2H` and `4H` -- fan functions claimed as spare buttons.
+  # Everything else is forwarded, `all off` included: it has to reach the MCU
+  # to stop the fan, and its light half is handled here in parallel.
   #
   # THIS SETTING AND THE R37/R38 REMOVAL ARE ONE CHANGE, which matters to
   # anyone rebuilding this from an unmodified board: until those resistors are
@@ -316,7 +317,7 @@ script:
             return clamp(cur + delta * (hi - lo), lo, hi);
 
 # The remote's light keys, acted on here rather than passed to the MCU, since
-# `relay: fan` above drops all six. `repeats` is left on where holding should
+# `relay: fan` above drops all seven. `repeats` is left on where holding should
 # ramp and turned off where a hold should register once.
 binary_sensor:
   - platform: fan_rf
@@ -385,10 +386,6 @@ binary_sensor:
             auto traits = id(led_light).get_traits();
             return (traits.get_min_mireds() + traits.get_max_mireds()) / 2.0f;
 
-  # Reaches the MCU as well: `night mode` is one of the five UNVERIFIED keys,
-  # so `relay: fan` forwards it and nobody knows what the MCU does with it. If
-  # it turns out to touch only the light, it belongs in key_domain()'s light
-  # group and this relay will stop.
   - platform: fan_rf
     name: "Remote: night mode"
     key: night_mode
@@ -400,13 +397,38 @@ binary_sensor:
           color_temperature: !lambda |-
             return id(led_light).get_traits().get_max_mireds();
 
-  # Also still relayed, and here that is the intent -- it stops the fan too.
   - platform: fan_rf
     name: "Remote: all off"
     key: all_off
     repeats: false
     on_press:
       - light.turn_off: led_light
+
+# --- claimed keys ----------------------------------------------------------
+# `natural wind`, `2H` and `4H` are DOMAIN_USER: never injected, so the MCU
+# never sees them and their OEM behaviour is gone. They are plain buttons now,
+# free for automations on the ESP32 or in Home Assistant.
+#
+# They carry no on_press here on purpose -- each is a bare entity waiting for
+# whatever it should do. Add an action below, or automate the entity from Home
+# Assistant. To hand one back to the fan, move it to DOMAIN_FAN in
+# components/fan_rf/fan_rf_protocol.h and drop its block here.
+#
+# `repeats: false` on all three: these are taps, and nothing here ramps.
+  - platform: fan_rf
+    name: "Custom: natural wind"
+    key: natural_wind
+    repeats: false
+
+  - platform: fan_rf
+    name: "Custom: 2H"
+    key: timer_2h
+    repeats: false
+
+  - platform: fan_rf
+    name: "Custom: 4H"
+    key: timer_4h
+    repeats: false
 
 # Commands originated here rather than relayed. `key` takes any name from the
 # table in PROTOCOL.md section 4, or a raw 0-31 value, and can be templated.

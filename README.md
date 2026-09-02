@@ -198,7 +198,17 @@ inject:   .   .   .   .   . F                tapped — starts at the deadline
 
 **The ESP32 owns the transmitted counter.** With the `102` out the MCU hears only the ESP32, so there is one sequence reaching it. It advances once per injected press and holds for every frame of that press. It is not persisted across reboot: ESP32 and MCU share the fan's secondary rail, so a power cycle resets both, and they can only disagree after an ESP32-only restart — costing at most one ignored command.
 
-`relay: fan` (the shipped setting) drops the six light keys and forwards the rest. `all` forwards everything. The split is a hand transcription: `bright ±`, `temp ±`, `light on/off` and `cycle full bright` are light; `fan 1`–`fan 6`, `fan off/forward/reverse` are fan. **`all off`, `night mode`, `natural wind`, `2H` and `4H` are unverified** — nobody has pressed them with the fan running and watched — so `fan` mode forwards them, on the grounds that dropping a button of unknown effect breaks something that works.
+`relay: fan` (the shipped setting) forwards only what the MCU still owns. `all` is a literal pass-through, for a board whose `R37`/`R38` are still fitted and where swallowing any key would break a working remote. Every button is classified by hand in `key_domain()` — `KEY` is a lookup table and nothing in a code predicts what it does:
+
+| Domain | Keys | In `fan` mode |
+|---|---|---|
+| light | `bright ±`, `temp ±`, `light on/off`, `cycle full bright`, `night mode` | Stops at the ESP32, which drives the LEDs |
+| fan | `fan 1`–`fan 6`, `fan off`, `fan forward`, `fan reverse` | Forwarded |
+| both | `all off` | **Forwarded** — it has to reach the MCU to stop the fan — *and* handled locally to kill the light |
+| user | `natural wind`, `2H`, `4H` | Never forwarded — see below |
+| unknown | the 12 codes this remote has no button for | Forwarded; a code nobody has seen is not one to start swallowing |
+
+**`natural wind`, `2H` and `4H` are claimed as spare buttons.** These are real fan functions — `natural wind` is a fan mode, and `2H`/`4H` are believed to be fan-off timers — that this build takes over because they are never used. They are withheld from the MCU, so their OEM behaviour is gone, and `relay.yaml` exposes each as a bare `Custom:` entity with no action attached, ready for an automation. Handing one back is a two-line change: move it to `DOMAIN_FAN` in `fan_rf_protocol.h` and drop its block from `relay.yaml`.
 
 ### Dimming
 

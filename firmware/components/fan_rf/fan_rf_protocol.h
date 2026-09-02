@@ -405,8 +405,9 @@ inline size_t build_frame(uint8_t key, uint8_t counter, int32_t *out, size_t cap
 
 // --- which half of the fan a button drives ----------------------------------
 //
-// Read off the button names in PROTOCOL.md section 4, never computed: KEY is a
-// lookup table and nothing in a code predicts what it does.
+// Read off the button names in PROTOCOL.md section 4 and confirmed by pressing
+// them, never computed: KEY is a lookup table and nothing in a code predicts
+// what it does.
 //
 // The relay runs in `fan` mode: the ESP32 drives the LEDs itself, so the light
 // keys stop there and only the fan half is forwarded. `all` forwards
@@ -414,9 +415,17 @@ inline size_t build_frame(uint8_t key, uint8_t counter, int32_t *out, size_t cap
 enum KeyDomain : uint8_t {
   DOMAIN_FAN,
   DOMAIN_LIGHT,
-  // Could act on the fan, the light or both. UNVERIFIED means exactly that: no
-  // one has pressed these with the fan running and watched what moved.
-  DOMAIN_UNVERIFIED,
+  // Drives both halves: `all off` stops the fan and kills the light, so it is
+  // forwarded to the MCU *and* acted on here.
+  DOMAIN_BOTH,
+  // Reserved for the owner's own automations, never injected. These are real
+  // buttons with real OEM behaviour -- see key_domain() for which and why --
+  // that this build deliberately takes over as spare inputs.
+  DOMAIN_USER,
+  // Not a button on this remote. Forwarded in `fan` mode on the same grounds
+  // the classification is conservative everywhere: a code nobody has seen is
+  // not one to start swallowing.
+  DOMAIN_UNKNOWN,
 };
 
 inline KeyDomain key_domain(uint8_t key) {
@@ -427,6 +436,9 @@ inline KeyDomain key_domain(uint8_t key) {
     case KEY_TEMP_DOWN:
     case KEY_LIGHT_TOGGLE:
     case KEY_CYCLE_FULL_BRIGHT:
+    // Observed: night mode acts on the light alone, so it stops here like the
+    // other six and the ESP32 implements it.
+    case KEY_NIGHT_MODE:
       return DOMAIN_LIGHT;
     case KEY_FAN_1:
     case KEY_FAN_2:
@@ -438,10 +450,19 @@ inline KeyDomain key_domain(uint8_t key) {
     case KEY_FAN_FORWARD:
     case KEY_FAN_REVERSE:
       return DOMAIN_FAN;
-    // all off, night mode, natural wind, 2H and 4H land here, and so does any
-    // key this remote does not have.
+    case KEY_ALL_OFF:
+      return DOMAIN_BOTH;
+    // Repurposed by choice, not by ignorance. `natural wind` is a fan mode and
+    // the MCU would act on it; 2H and 4H are believed to be fan-off timers,
+    // never used either. The owner does not use any of the three, so they are
+    // free inputs for automations here and are not injected. Moving one back
+    // to DOMAIN_FAN restores its OEM behaviour and costs nothing else.
+    case KEY_NATURAL_WIND:
+    case KEY_TIMER_2H:
+    case KEY_TIMER_4H:
+      return DOMAIN_USER;
     default:
-      return DOMAIN_UNVERIFIED;
+      return DOMAIN_UNKNOWN;
   }
 }
 
@@ -453,13 +474,19 @@ enum RelayMode : uint8_t {
 
 inline bool relay_key(RelayMode mode, uint8_t key) {
   switch (mode) {
+    // Literal pass-through, including the DOMAIN_USER keys: `all` is the mode
+    // for a board whose R37/R38 are still fitted, where the ESP32 drives
+    // nothing and swallowing any key would just break a working remote.
     case RELAY_ALL:
       return true;
-    // Fan mode forwards the unverified keys too. Dropping a button whose effect
-    // is unknown breaks something that works today; forwarding one that turns
-    // out to be light-only just leaves the OEM behaviour where it already is.
-    case RELAY_FAN:
-      return key_domain(key) != DOMAIN_LIGHT;
+    // Fan mode drops what the ESP32 owns: the light keys, and the three the
+    // owner has claimed for automations. DOMAIN_BOTH is forwarded -- `all off`
+    // has to reach the MCU to stop the fan, and the light half is handled here
+    // in parallel.
+    case RELAY_FAN: {
+      const KeyDomain d = key_domain(key);
+      return d != DOMAIN_LIGHT && d != DOMAIN_USER;
+    }
     default:
       return false;
   }

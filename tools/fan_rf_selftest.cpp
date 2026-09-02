@@ -689,8 +689,10 @@ static void check_relay_gate() {
 static void check_key_domains() {
   printf("-- fan / light classification --\n");
 
-  // Transcribed from the button names in PROTOCOL.md section 4. The five marked
-  // UNVERIFIED could act on the fan, the light or both; nobody has watched.
+  // Transcribed from the button names in PROTOCOL.md section 4 and from
+  // pressing them. `all off` drives both halves. The last three are fan
+  // functions the owner has claimed as spare inputs -- a deliberate override,
+  // not a gap in what is known.
   struct DomainRow {
     uint8_t key;
     KeyDomain domain;
@@ -699,13 +701,13 @@ static void check_key_domains() {
       {KEY_BRIGHT_UP, DOMAIN_LIGHT},          {KEY_BRIGHT_DOWN, DOMAIN_LIGHT},
       {KEY_TEMP_UP, DOMAIN_LIGHT},            {KEY_TEMP_DOWN, DOMAIN_LIGHT},
       {KEY_LIGHT_TOGGLE, DOMAIN_LIGHT},       {KEY_CYCLE_FULL_BRIGHT, DOMAIN_LIGHT},
-      {KEY_FAN_1, DOMAIN_FAN},                {KEY_FAN_2, DOMAIN_FAN},
-      {KEY_FAN_3, DOMAIN_FAN},                {KEY_FAN_4, DOMAIN_FAN},
-      {KEY_FAN_5, DOMAIN_FAN},                {KEY_FAN_6, DOMAIN_FAN},
-      {KEY_FAN_OFF, DOMAIN_FAN},              {KEY_FAN_FORWARD, DOMAIN_FAN},
-      {KEY_FAN_REVERSE, DOMAIN_FAN},          {KEY_ALL_OFF, DOMAIN_UNVERIFIED},
-      {KEY_NIGHT_MODE, DOMAIN_UNVERIFIED},    {KEY_NATURAL_WIND, DOMAIN_UNVERIFIED},
-      {KEY_TIMER_2H, DOMAIN_UNVERIFIED},      {KEY_TIMER_4H, DOMAIN_UNVERIFIED},
+      {KEY_NIGHT_MODE, DOMAIN_LIGHT},         {KEY_FAN_1, DOMAIN_FAN},
+      {KEY_FAN_2, DOMAIN_FAN},                {KEY_FAN_3, DOMAIN_FAN},
+      {KEY_FAN_4, DOMAIN_FAN},                {KEY_FAN_5, DOMAIN_FAN},
+      {KEY_FAN_6, DOMAIN_FAN},                {KEY_FAN_OFF, DOMAIN_FAN},
+      {KEY_FAN_FORWARD, DOMAIN_FAN},          {KEY_FAN_REVERSE, DOMAIN_FAN},
+      {KEY_ALL_OFF, DOMAIN_BOTH},             {KEY_NATURAL_WIND, DOMAIN_USER},
+      {KEY_TIMER_2H, DOMAIN_USER},            {KEY_TIMER_4H, DOMAIN_USER},
   };
   const size_t rows = sizeof(ROWS) / sizeof(ROWS[0]);
   checkf(rows == KEY_COUNT, "every button is classified (%zu of %zu)", rows, KEY_COUNT);
@@ -713,16 +715,32 @@ static void check_key_domains() {
   for (size_t i = 0; i < rows; i++) {
     checkf(key_domain(ROWS[i].key) == ROWS[i].domain, "%s is classified as expected",
            key_name(ROWS[i].key));
+    // `all` stays a literal pass-through even for the claimed keys -- it is the
+    // mode for a board the ESP32 does not drive.
     check(relay_key(RELAY_ALL, ROWS[i].key), "relay: all forwards everything");
     check(!relay_key(RELAY_NONE, ROWS[i].key), "relay: none forwards nothing");
-    // Fan mode drops the light keys and keeps the unverified ones: dropping a
-    // button whose effect is unknown would break something that works.
-    checkf(relay_key(RELAY_FAN, ROWS[i].key) == (ROWS[i].domain != DOMAIN_LIGHT),
+    // Fan mode drops what the ESP32 owns -- the light keys and the claimed
+    // ones -- and forwards the rest, `all off` included, since it has to reach
+    // the MCU to stop the fan.
+    const bool expect_fan =
+        ROWS[i].domain != DOMAIN_LIGHT && ROWS[i].domain != DOMAIN_USER;
+    checkf(relay_key(RELAY_FAN, ROWS[i].key) == expect_fan,
            "relay: fan handles %s correctly", key_name(ROWS[i].key));
   }
 
-  // A key this remote does not have is unverified, never silently a fan key.
-  check(key_domain(0) == DOMAIN_UNVERIFIED, "an unlisted key is unverified");
+  // `all off` reaches the MCU: the light half is handled locally in parallel,
+  // but the fan half is the MCU's and dropping it would strand the fan running.
+  check(relay_key(RELAY_FAN, KEY_ALL_OFF), "relay: fan forwards all off");
+  // The claimed keys never reach the MCU in fan mode. This is the whole point
+  // of DOMAIN_USER and is the assertion that catches a careless reclassify.
+  check(!relay_key(RELAY_FAN, KEY_NATURAL_WIND), "relay: fan withholds natural wind");
+  check(!relay_key(RELAY_FAN, KEY_TIMER_2H), "relay: fan withholds 2H");
+  check(!relay_key(RELAY_FAN, KEY_TIMER_4H), "relay: fan withholds 4H");
+
+  // A key this remote does not have is unknown, never silently a fan key --
+  // though fan mode still forwards it, as it does anything unclassified.
+  check(key_domain(0) == DOMAIN_UNKNOWN, "an unlisted key is unknown");
+  check(relay_key(RELAY_FAN, 0), "relay: fan forwards an unlisted key");
 }
 
 // --- log replay (diagnostic) ------------------------------------------------
