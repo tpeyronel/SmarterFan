@@ -1,71 +1,40 @@
 # SmarterFan — milestone 2: RF relay + LED dimming
 #
 # Decodes the remote off the OEM receiver's output pad (GPIO6) and injects
-# reconstructed commands into the OEM MCU's RF input (GPIO5), so every fan
-# button still works while the ESP32 sits in the middle of the path. The six
-# light keys stop here instead: the ESP32 drives the two dimming optocouplers
-# itself (GPIO7, GPIO10) and the light is one CWWW entity.
+# reconstructed commands into the OEM MCU's RF input (GPIO5). The light keys
+# stop here instead: the ESP32 drives the two dimming optocouplers itself
+# (GPIO7, GPIO10) as one CWWW entity.
 #
-# REQUIRES THE BOARD MODIFIED, both modifications:
-#   - the `102` between the RF receiver output and the MCU input removed, and a
-#     level shifter on both lines;
-#   - `R37` and `R38` removed, and a 620 Ohm from each of GPIO7 and GPIO10 to
-#     the opto-side pad each one leaves floating.
-# See README.md. firmware/sniffer.yaml is the read-only build and needs
-# neither.
-#
-# Injecting on GPIO5 BEFORE the 102 is removed is not destructive: the ESP32
-# and the OEM receiver then both drive the MCU input through a 1 kOhm and the
-# two fight through 2 kOhm. It is also not a useful test, because whichever
-# source is asserting low wins and the MCU sees a mixture of the two.
+# REQUIRES BOTH BOARD MODIFICATIONS -- the `102` between receiver and MCU out
+# with a level shifter on both lines, and `R37`/`R38` out with a 620 Ohm from
+# GPIO7 and GPIO10 to the pads they leave floating. See README.md.
+# firmware/sniffer.yaml is the read-only build and needs neither.
 
 # --- bring-up knobs --------------------------------------------------------
-# Settled against hardware except where a comment says otherwise. What is still
-# open is in README.md.
+# Settled against hardware except where noted. Open questions are in README.md.
 substitutions:
-  # Optocoupler polarity, MEASURED: more current through the PC817 is brighter
-  # at the MT9722S dim input, so `false`. Both channels are wired the same way
-  # and move together.
+  # Non-inverting: more opto current = brighter. Measured. Both channels alike.
   led_inverted: "false"
 
-  # The duty a channel sits at when it is on but asked for the least possible.
-  # STILL UNMEASURED, and the one knob with real dimming range left in it. At
-  # 250 Hz, 1% is a 40 us pulse, which is known to produce plenty of light --
-  # the driver's minimum pulse width is bracketed between 10 us (too short, at
-  # 1 kHz) and that 40 us, so there may be up to another 4x of range below
-  # here. Sweep down -- 0.5%, 0.3%, 0.2% -- and find where the light stops
-  # getting dimmer; this belongs just above that. Per channel, because the two
-  # optocouplers are separate parts and need not share a floor.
+  # Duty floor per channel, on but at its dimmest. UNMEASURED -- sweep down
+  # from 1% and stop just above where the light stops dimming. See README.
   min_power_r37: "1%"
   min_power_r38: "1%"
 
-  # PWM frequency, both channels, and the knob that decides how dim the light
-  # can get. The MT9722S gates its output rather than averaging the dim input,
-  # so the lowest usable duty is the driver's minimum pulse width times this
-  # frequency: a lower carrier is a dimmer minimum, which is the opposite of
-  # the usual instinct. Three things bound it from below -- flicker, visible
-  # under ~250 Hz; beating against the 100 Hz mains ripple already on the LED
-  # current, so sit between harmonics and not on one; and blade strobing, which
-  # is per fan speed and HAS NOT BEEN CHECKED. This sits exactly on the
-  # measured flicker floor, with no margin for that last one. The OEM ran
-  # 1 kHz, and its dimmest step was 7.4% duty.
+  # Lower carrier = dimmer minimum (the MT9722S gates, it does not average).
+  # 250 Hz sits exactly on the measured flicker floor. See README > Dimming.
   pwm_frequency: "0.25kHz"
 
-  # One step of a brightness button. A held button pulses once per frame,
-  # 41.1 ms apart, so 2% sweeps the whole range in 50 steps, ~2.1 s. A tap is
-  # one step of the same size -- the remote has no way to say otherwise, and
-  # that is how the OEM behaves.
+  # One step of a brightness button. A hold pulses every 41.1 ms, so 2% sweeps
+  # the range in ~2.1 s. A tap is one step of the same size.
   dim_step: "2%"
 
-  # ...and the floor a hold stops at. light.dim_relative switches the light off
-  # when it arrives at zero, so without this, holding `bright -` would end with
-  # the light off rather than at its dimmest. `light on/off` and `all off` are
-  # the buttons for turning it off.
+  # Floor a hold stops at: dim_relative switches the light off at zero, and
+  # `light on/off` / `all off` are the buttons for that.
   dim_floor: "1%"
 
-  # One step of a colour temperature button, as a fraction of the light's
-  # mireds range, so the sweep stays ~2 s whatever the Kelvin endpoints below
-  # are corrected to.
+  # One colour temperature step, as a fraction of the mireds range, so the
+  # sweep stays ~2 s whatever the Kelvin endpoints below become.
   ct_step: "0.02"
 
 esphome:
@@ -102,12 +71,8 @@ ota:
   - platform: esphome
     password: !secret ota_password
 
-# A control page served by the device itself, at http://smarterfan-relay.local/
-# -- every entity below with a control for it, no server anywhere. This is the
-# whole interface if Home Assistant is never set up; if it is, the two coexist.
-#
-# Unauthenticated, so anything on the LAN can drive the light. `auth:` with a
-# username and password is the knob if that is not wanted.
+# http://smarterfan-relay.local/ -- a control for every entity, served by the
+# device. Unauthenticated; add `auth:` if that is not wanted.
 web_server:
   port: 80
 
@@ -118,16 +83,14 @@ external_components:
     components: [fan_rf]
 
 # --- receive: the OEM receiver's output pad --------------------------------
-# Identical to sniffer.yaml. Every value here was settled against real captures
-# and the reasoning is written up there; do not diverge without a reason.
+# Identical to sniffer.yaml; every value settled against real captures. See
+# README > Two settings that matter before changing any of it.
 remote_receiver:
   pin:
     number: GPIO6
-  # Below the 136us shortest real symbol under worst-case AGC skew, and above
-  # the idle noise, which is what keeps captures press-correlated.
+  # Below the 136us shortest real symbol, above the idle noise.
   filter: 100us
-  # Deliberately below the 8.79ms inter-frame gap, so each of a burst's five
-  # repeats is its own capture and a held button never fills the buffer.
+  # Below the 8.79ms inter-frame gap, so each repeat is its own capture.
   idle: 4ms
   receive_symbols: 1024
   buffer_size: 32768
@@ -138,34 +101,19 @@ remote_transmitter:
   id: fan_tx
   pin: GPIO5
 
-  # OOK at baseband. What arrives at the MCU is the demodulated two-level
-  # signal the OEM receiver would have produced, not a 433 MHz carrier, so
-  # there is nothing to modulate: 100% duty is the carrier switched off.
-  # fan_rf also sets carrier_frequency 0 on every call it makes.
+  # OOK at baseband -- the MCU wants the demodulated signal, not a carrier, so
+  # 100% duty is the carrier switched off.
   carrier_duty_percent: 100%
 
-  # RMT memory for this channel, in 32-bit symbols. The C3 has 48 words per
-  # channel and this is the default; it is written out because the payload
-  # size depends on it.
-  #
-  # Each signed duration fan_rf emits becomes one 16-bit half-symbol, two to a
-  # word. The largest payload is the preamble plus one frame: 2 + 66 = 68
-  # halves = 34 words. The IDF's first encoding session fills the whole memory
-  # block, so at 48 the burst is staged in one pass and the transmission never
-  # depends on a refill interrupt landing on time. A bare frame during a hold
-  # is 33 words.
-  #
-  # `tap_frames` above 1 pushes past that — 5 frames is 166 words — and the
-  # driver then ping-pongs through half the block at a time. That works, but it
-  # puts symbol timing at the mercy of interrupt latency, so raise this to 96
-  # if you raise tap_frames, and drop remote_receiver's `rmt_symbols` to 48 to
-  # stay inside the C3's 192 words in total.
+  # RMT symbols for this channel (the C3 default, stated because the payload
+  # depends on it). Largest payload is preamble + one frame = 34 words, so the
+  # burst stages in one pass and never depends on a refill interrupt. Raising
+  # `tap_frames` overflows that: go to 96 here and drop the receiver's
+  # rmt_symbols to 48 to stay inside the C3's 192 words.
   rmt_symbols: 48
 
-  # The RMT hands the line back after each frame instead of blocking loop() for
-  # the 41.4 ms the frame takes. A hold injects one frame per received repeat,
-  # and the next repeat is already being decoded while the current frame goes
-  # out — blocking here would stall that.
+  # Hand the line back after each frame rather than blocking loop() for 41.4 ms
+  # -- the next received repeat is decoded while the current frame goes out.
   non_blocking: true
 
 fan_rf:
@@ -175,41 +123,31 @@ fan_rf:
   press_frames: 5
   run_timeout: 250ms
   dump_frames: false
-  # Prints the injected frames as well as the decoded ones, which is the whole
-  # diagnostic for the relay until a scope is on the MCU's input pad:
+  # Injected frames as well as decoded ones -- the whole relay diagnostic until
+  # a scope is on the MCU's input pad:
   #
   #   [D][fan_rf]: press  key=18 (fan 2) counter=3  0xA1D8290D
   #   [D][fan_rf]: inject key=18 (fan 2) counter=1  0xA1D82919  1x +preamble
   dump_commands: true
 
-  # The seven light keys stop here now that the ESP32 drives the LEDs, and so
-  # do `natural wind`, `2H` and `4H` -- fan functions claimed as spare buttons.
-  # Everything else is forwarded, `all off` included: it has to reach the MCU
-  # to stop the fan, and its light half is handled here in parallel.
-  #
-  # THIS SETTING AND THE R37/R38 REMOVAL ARE ONE CHANGE, which matters to
-  # anyone rebuilding this from an unmodified board: until those resistors are
-  # out, the ESP32 is not connected to the optocouplers and `fan` leaves the
-  # light with nothing driving it -- the MCU stops hearing the light keys and
-  # the PWM on GPIO7/GPIO10 goes nowhere. Run `all` until the board is cut.
+  # Forward fan keys only; light keys and the three claimed buttons stop here.
+  # `all off` is forwarded too (it must reach the MCU) and handled locally in
+  # parallel. THIS AND THE R37/R38 REMOVAL ARE ONE CHANGE -- on an uncut board
+  # the ESP32 is not connected to the optocouplers, so `fan` leaves the light
+  # dead. Run `all` until the resistors are out. See README for the key table.
   relay: fan
 
-  # How long a press waits before it counts as a tap. Pure added latency on
-  # every tap, and it cannot go below press_frames x 41.1 ms = 205 ms, which is
-  # where the first repeat of a held button lands. See fan_rf/__init__.py.
+  # Tap/hold deadline, and pure added latency on every tap. Cannot go below
+  # press_frames x 41.1 ms = 205 ms, where the first repeat of a hold lands.
   relay_decision: 230ms
 
-  # Frames one tap injects. One is enough: the fan keys tap through to the MCU
-  # at this setting, on hardware. The remote sends five, but that redundancy is
-  # for a noisy RF link and this goes over a wire. Raise it if a tap ever turns
-  # out to be dropped — and raise remote_transmitter's rmt_symbols with it.
+  # Frames per tap. One is enough on hardware -- the remote's five are for a
+  # noisy RF link and this is a wire. Raise rmt_symbols above if you raise it.
   tap_frames: 1
 
-# Diagnostics. An ESP32 reset takes the GPIOs high-Z, which drops the drive to
-# both optocouplers -- indistinguishable from a brief flicker if the reboot is
-# quick. Uptime resetting to zero, or a reset_reason other than a clean power-on,
-# is what separates that from anything happening in the analogue path. Remove
-# once the flicker question is closed.
+# Diagnostics for the flicker question: a reset takes the GPIOs high-Z and
+# drops both optocouplers, which looks just like a flicker. Uptime and
+# reset_reason are what separate the two. Remove once that is closed.
 debug:
   update_interval: 30s
 
@@ -223,31 +161,27 @@ sensor:
     name: "Uptime"
     update_interval: 30s
 
-  # Wi-Fi TX bursts to ~350 mA on the C3, and the drive to both optocouplers
-  # comes off the same 3V3 rail. If flickers cluster with radio activity, the
-  # bulk capacitance on that rail is the first suspect.
+  # Wi-Fi TX bursts to ~350 mA off the same 3V3 rail as the opto drive. If
+  # flickers cluster with radio activity, suspect that rail's bulk capacitance.
   - platform: wifi_signal
     name: "WiFi signal"
     update_interval: 60s
 
 # --- LED dimming: the two optocouplers -------------------------------------
 # Each GPIO drives a PC817 through 620 Ohm into the pad `R37`/`R38` left
-# floating by the modification. Named after the pad rather than the colour,
-# because which pad is which colour is not known -- see the light below.
+# floating by the modification. Named after the pad, not the colour.
 #
 # Frequency and min_power are one setting in two halves -- what the opto sees
-# is a pulse width, min_power / frequency -- so both live in the substitutions
-# above and neither moves alone.
+# is a pulse width, min_power / frequency -- so neither moves alone.
 output:
   - platform: ledc
     id: led_r37
     pin: GPIO7
     frequency: ${pwm_frequency}
     min_power: ${min_power_r37}
-    # Mandatory next to min_power, not a refinement of it. The mix commands one
-    # channel to exactly zero at either end of the colour temperature range,
-    # and without this that channel would still emit min_power -- a faint cool
-    # glow across a "fully warm" setting that never goes away.
+    # Mandatory next to min_power: the mix commands one channel to exactly zero
+    # at either end of the CT range, and without this it would still emit
+    # min_power -- a faint glow that never goes away.
     zero_means_zero: true
     inverted: ${led_inverted}
 
@@ -264,45 +198,37 @@ light:
     id: led_light
     name: "Light"
 
-    # MEASURED by observation: R38 (GPIO10) is the cold channel and R37
-    # (GPIO7) the warm one.
+    # Measured by observation: R38/GPIO10 is cold, R37/GPIO7 is warm.
     cold_white: led_r38
     warm_white: led_r37
 
-    # Guesses -- nothing has measured either channel. These set the ends of the
-    # Home Assistant slider and the Kelvin it is labelled with; the mix
-    # normalises whatever range they describe, so the hardware does exactly the
-    # same thing whatever numbers go here.
+    # Guesses -- neither channel has been measured. These only label the HA
+    # slider; the mix normalises whatever range they describe.
     cold_white_color_temperature: 6500K
     warm_white_color_temperature: 2700K
 
-    # The default, stated because it is load-bearing. Each channel's duty is
-    # brightness x its fraction, and the two fractions are normalised by the
-    # larger of them: in the middle of the range both come out at 1.0, so at
-    # 100% brightness both LEDs are at full. The price is that total output is
-    # not constant as the slider sweeps -- it roughly doubles toward the middle
-    # -- which is visible, and is what being able to reach full output costs.
+    # The default, stated because it is load-bearing: without it 100% cannot
+    # drive both LEDs to full. The price is that total output roughly doubles
+    # toward the middle of the CT sweep, which is visible.
     constant_brightness: false
 
-    # A held button delivers 24 steps a second and the default is 1s, so this
-    # would otherwise be 24 overlapping one-second fades. Automations that want
-    # a fade -- the sunrise alarm -- pass their own transition_length.
+    # A hold delivers 24 steps a second; the 1s default would overlap them all.
+    # Automations that want a fade pass their own transition_length.
     default_transition_length: 0s
 
-    # Brightness, mix and on/off all come back after a restart. This does mean
-    # the light turns itself on when a blackout ends.
+    # Brightness, mix and on/off survive a restart -- including turning the
+    # light back on when a blackout ends.
     restore_mode: RESTORE_DEFAULT_OFF
 
-# ESPHome has light.dim_relative but no colour temperature equivalent, and this
-# script is the whole of that gap.
+# ESPHome has light.dim_relative but no colour temperature equivalent.
 script:
   - id: colour_temp_step
     parameters:
-      # Signed fraction of the light's mireds range; positive is warmer.
+      # Signed fraction of the mireds range; positive is warmer.
       delta: float
     then:
-      # control, not turn_on: pressing temp+ on a light that is off adjusts the
-      # mix it will come back at instead of switching it on.
+      # control, not turn_on: temp+ on a light that is off adjusts the mix it
+      # will come back at rather than switching it on.
       - light.control:
           id: led_light
           color_temperature: !lambda |-
@@ -310,15 +236,13 @@ script:
             const float lo = traits.get_min_mireds();
             const float hi = traits.get_max_mireds();
             float cur = id(led_light).remote_values.get_color_temperature();
-            // Zero until something sets a colour temperature -- a first boot
-            // with nothing restored. Start such a press from the middle.
+            // Zero on a first boot with nothing restored: start from the middle.
             if (cur < lo || cur > hi)
               cur = (lo + hi) / 2.0f;
             return clamp(cur + delta * (hi - lo), lo, hi);
 
-# The remote's light keys, acted on here rather than passed to the MCU, since
-# `relay: fan` above drops all seven. `repeats` is left on where holding should
-# ramp and turned off where a hold should register once.
+# The light keys, acted on here since `relay: fan` drops them. `repeats` stays
+# on where a hold should ramp, off where it should register once.
 binary_sensor:
   - platform: fan_rf
     name: "Remote: brightness up"
@@ -331,9 +255,8 @@ binary_sensor:
             min_brightness: ${dim_floor}
             max_brightness: 100%
 
-  # Either brightness button wakes a light that is off, at the bottom of its
-  # range -- dim_relative works off state x brightness, so an off light reads
-  # as zero and the clamp brings it back up to the floor.
+  # Either brightness button wakes an off light at the bottom of its range:
+  # dim_relative reads an off light as zero and the clamp lifts it to the floor.
   - platform: fan_rf
     name: "Remote: brightness down"
     key: bright_down
@@ -345,10 +268,8 @@ binary_sensor:
             min_brightness: ${dim_floor}
             max_brightness: 100%
 
-  # temp+ raises the colour temperature in Kelvin, i.e. towards cooler, which
-  # is a fall in mireds -- hence the negative delta. Which way the OEM's two
-  # buttons actually go has never been observed; swapping these two signs is
-  # the whole change if this is backwards.
+  # temp+ means cooler, i.e. fewer mireds -- hence the negative delta. Which
+  # way the OEM buttons actually go is unobserved; swap the signs if backwards.
   - platform: fan_rf
     name: "Remote: colour temperature up"
     key: colour_temp_up
@@ -380,8 +301,7 @@ binary_sensor:
       - light.turn_on:
           id: led_light
           brightness: 100%
-          # The middle of the range: both fractions are 0.5, both normalise to
-          # 1.0, both LEDs end up at full.
+          # Middle of the range: both fractions normalise to 1.0, both LEDs full.
           color_temperature: !lambda |-
             auto traits = id(led_light).get_traits();
             return (traits.get_min_mireds() + traits.get_max_mireds()) / 2.0f;
@@ -405,16 +325,10 @@ binary_sensor:
       - light.turn_off: led_light
 
 # --- claimed keys ----------------------------------------------------------
-# `natural wind`, `2H` and `4H` are DOMAIN_USER: never injected, so the MCU
-# never sees them and their OEM behaviour is gone. They are plain buttons now,
-# free for automations on the ESP32 or in Home Assistant.
-#
-# They carry no on_press here on purpose -- each is a bare entity waiting for
-# whatever it should do. Add an action below, or automate the entity from Home
-# Assistant. To hand one back to the fan, move it to DOMAIN_FAN in
-# components/fan_rf/fan_rf_protocol.h and drop its block here.
-#
-# `repeats: false` on all three: these are taps, and nothing here ramps.
+# DOMAIN_USER: never injected, so their OEM behaviour is gone and they are
+# plain buttons now. Deliberately actionless -- add an action here or automate
+# the entity from Home Assistant. To hand one back to the fan, move it to
+# DOMAIN_FAN in components/fan_rf/fan_rf_protocol.h and drop its block.
   - platform: fan_rf
     name: "Custom: natural wind"
     key: natural_wind
@@ -430,17 +344,13 @@ binary_sensor:
     key: timer_4h
     repeats: false
 
-# Commands originated here rather than relayed. `key` takes any name from the
-# table in PROTOCOL.md section 4, or a raw 0-31 value, and can be templated.
+# Commands originated here rather than relayed. `key` takes any name from
+# PROTOCOL.md section 4, or a raw 0-31 value, and can be templated.
 button:
-  # Diagnostic for the occasional flicker. The radio is the largest current
-  # step on the 3V3 rail the optocoupler drive shares, so taking it away for a
-  # while is the cleanest way to ask whether it is the aggressor. The remote
-  # keeps working throughout -- the decode path is RMT and never touches the
-  # network stack -- so the light stays usable with nothing on the air.
-  #
-  # It re-enables itself, and a crash reboots with the radio on, so there is no
-  # way for this to strand the board.
+  # Flicker diagnostic: the radio is the largest current step on the 3V3 rail
+  # the opto drive shares. The remote keeps working with it down -- the decode
+  # path is RMT and never touches the network stack -- and it re-enables
+  # itself, so there is no way to strand the board.
   - platform: template
     name: "Diagnostic: radio off 30 min"
     on_press:
