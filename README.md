@@ -181,6 +181,14 @@ The knobs are `relay.yaml`'s `substitutions:` block, documented in place.
 
 **`filter` must stay below 136 µs**, the shortest real symbol under worst-case AGC skew. At 200 µs the compressed early spaces merge away and frame 1 is destroyed. Don't reach for it to suppress noise either — noise median pulse width is 343 µs and overlaps the real symbols completely. `filter_symbols: 120` is the right tool: garbage bursts run to at most 95 symbols against a real packet's 166.
 
+### Two defaults that reboot the fan
+
+`api:` and `wifi:` each default to **`reboot_timeout: 15min`** — the first restarts the device when no API client has connected for that long, the second when the network has been unreachable. Both are `0s` in `relay.yaml`.
+
+Otherwise, with no Home Assistant on the network, the ESP32 restarts **every 15 minutes, forever**, and each restart blanks both optocouplers for the few hundred ms the light takes to come back. It presents as an occasional flicker at *any* brightness, indistinguishable from a fault in the dim path. Two things hide it: attaching `esphome logs` is itself an API client, so watching stops it, and the `web_server` page does not count. `Uptime` back to seconds, alongside `Reset reason`, is the tell.
+
+The defaults suit a sensor that exists to reach Home Assistant. Here the job that matters is relaying the remote, which never touches the network stack — and the cost of `0s` is that a wedged radio needs a power cycle at the wall.
+
 ### Press, hold and relay
 
 The remote has no repeat code — a held button just resends the same frame, counter unchanged, every 41.1 ms. The first frame of a new codeword is the press; the next four are swallowed so a tap fires once (even when AGC eats frame 1 and only four arrive); everything past them is a hold. A run ends when the codeword changes or after `run_timeout` (250 ms), which is what stops the ninth press of a button — the counter wraps at 8 — reading as the same hold continuing.
@@ -256,6 +264,7 @@ Three properties shape everything else:
 - **The LED path works.** `R37`/`R38` out, 620 Ω from GPIO 7 and GPIO 10, 250 Hz, `min_power: 1%` — and the light dims far below the OEM minimum, which was the point of the project. A 40 µs pulse against the OEM's dimmest 74 µs at four times the repetition rate.
 - **The RF relay works in both directions.** The remote's light keys reach the decoder and drive the light; its fan keys are reconstructed and injected into the OEM MCU, which accepts them.
 - Optocouplers are non-inverting from the ESP32's side (`led_inverted: "false"`); **`R38`/GPIO 10 is cold, `R37`/GPIO 7 is warm**.
+- **An occasional flicker at any brightness was the ESP32 rebooting itself**, not the analogue path — `api:` and `wifi:` both default to `reboot_timeout: 15min`. See [Two defaults that reboot the fan](#two-defaults-that-reboot-the-fan).
 - MCU output high 4.48 V, post-resistor 1.12 V, 3.36 mA. OEM dim PWM 1 kHz, lowest step 7.4% duty.
 - **The low-voltage DC bus is 24 V** at rest, which is what the MP1584 runs from.
 - Receiver output pad floors at 0 V unloaded, 0.8 V with a BSS138 attached (its pull-ups force ~620 µA in) — clears the MCU's 1.12 V V<sub>IL</sub>, not the ESP32's 0.825 V.
@@ -272,7 +281,6 @@ Three properties shape everything else:
 - [ ] **`t_min`, the minimum pulse width the dim chain responds to.** Bracketed between 10 µs and 40 µs — worth up to another 4× of dimming range at 250 Hz. 1% is a 40 µs pulse and produces plenty of light, so sweep `min_power` down from there — 0.5%, 0.3%, 0.2% — and find where the light stops getting dimmer; `min_power_r37`/`_r38` then belong just above it, and need not match. Which part imposes it, the PC817 or the `MT9722S`, is a second question.
 - [ ] **Stroboscopic beating between the 250 Hz dim PWM and the blades**, at each of the six fan speeds. The one thing that could force the carrier back up.
 - [ ] **Whether 250 Hz is flicker-free for other people.** It is the measured threshold, not a value with margin.
-- [ ] **An occasional one- or two-cycle flicker**, at both minimum and full brightness. Not the PWM — at full brightness neither pin toggles. Both optocouplers develop 3.5 mA across only 2.18 V of headroom off the same 3V3 rail the C3's Wi-Fi bursts sit on, where the OEM had 3.36 V off a rail feeding nothing but an 8-bit MCU, so a rail dip was the first suspect; 470 µF and 100 nF are now on both rails and it persists. Brownout and mains-side transients are the other candidates. The `Diagnostic: radio off 30 min` button in `relay.yaml` tests the radio theory cheaply — the remote still drives the light with the radio down.
 - [ ] **How far the 24 V bus rises when the motor decelerates.** The MP1584 is a 28 V part with a 30 V absolute maximum, so the headroom is ~4 V and the failure mode is not graceful — see [Power](#power). Scope the bus across a 6→off transition at the buck's input.
 - [ ] **Whether the MCU dedupes on the press counter at all.** The counter policy is built on what the *remote* does; if the MCU ignores the field, the policy costs nothing either way. (A single injected frame *is* enough — taps relay through at `tap_frames: 1`.)
 - [ ] Whether the 20-bit prefix is a per-remote ID, a protocol constant, or both. Separating them needs a second remote — until then, do not assume a synthesised frame is accepted by any other unit.

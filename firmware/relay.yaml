@@ -55,6 +55,11 @@ wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
   output_power: 12db
+
+  # Reboots 15min after the network goes away. The remote needs no network, so
+  # a router outage would blink the light every 15 minutes for nothing. Cost of
+  # 0s: a wedged radio needs a power cycle at the wall.
+  reboot_timeout: 0s
   ap:
     ssid: "SmarterFan Setup"
     password: !secret ap_password
@@ -66,6 +71,12 @@ improv_serial:
 api:
   encryption:
     key: !secret api_key
+
+  # The same default, and the one that bites: with no API client connected the
+  # device reboots itself every 15 minutes, forever, blanking both optocouplers
+  # each time. The web_server page does NOT count; only the native API resets
+  # the timer. See README > Two defaults that reboot the fan.
+  reboot_timeout: 0s
 
 ota:
   - platform: esphome
@@ -123,8 +134,7 @@ fan_rf:
   press_frames: 5
   run_timeout: 250ms
   dump_frames: false
-  # Injected frames as well as decoded ones -- the whole relay diagnostic until
-  # a scope is on the MCU's input pad:
+  # Injected frames as well as decoded ones:
   #
   #   [D][fan_rf]: press  key=18 (fan 2) counter=3  0xA1D8290D
   #   [D][fan_rf]: inject key=18 (fan 2) counter=1  0xA1D82919  1x +preamble
@@ -132,9 +142,7 @@ fan_rf:
 
   # Forward fan keys only; light keys and the three claimed buttons stop here.
   # `all off` is forwarded too (it must reach the MCU) and handled locally in
-  # parallel. THIS AND THE R37/R38 REMOVAL ARE ONE CHANGE -- on an uncut board
-  # the ESP32 is not connected to the optocouplers, so `fan` leaves the light
-  # dead. Run `all` until the resistors are out. See README for the key table.
+  # parallel. See README for the key table.
   relay: fan
 
   # Tap/hold deadline, and pure added latency on every tap. Cannot go below
@@ -145,9 +153,9 @@ fan_rf:
   # noisy RF link and this is a wire. Raise rmt_symbols above if you raise it.
   tap_frames: 1
 
-# Diagnostics for the flicker question: a reset takes the GPIOs high-Z and
-# drops both optocouplers, which looks just like a flicker. Uptime and
-# reset_reason are what separate the two. Remove once that is closed.
+# A restart takes the GPIOs high-Z and drops both optocouplers for the few
+# hundred ms the light needs to come back, which reads as a flicker. Uptime and
+# reset_reason are how that is told apart from the analogue path after the fact.
 debug:
   update_interval: 30s
 
@@ -161,8 +169,8 @@ sensor:
     name: "Uptime"
     update_interval: 30s
 
-  # Wi-Fi TX bursts to ~350 mA off the same 3V3 rail as the opto drive. If
-  # flickers cluster with radio activity, suspect that rail's bulk capacitance.
+  # Antenna and placement check -- a canopy is a poor RF environment. README
+  # wants better than -70 dBm from the mounted position.
   - platform: wifi_signal
     name: "WiFi signal"
     update_interval: 60s
@@ -244,6 +252,8 @@ script:
 # The light keys, acted on here since `relay: fan` drops them. `repeats` stays
 # on where a hold should ramp, off where it should register once.
 binary_sensor:
+  # Either brightness button wakes an off light at the bottom of its range:
+  # dim_relative reads an off light as zero and the clamp lifts it to the floor.
   - platform: fan_rf
     name: "Remote: brightness up"
     key: bright_up
@@ -255,8 +265,6 @@ binary_sensor:
             min_brightness: ${dim_floor}
             max_brightness: 100%
 
-  # Either brightness button wakes an off light at the bottom of its range:
-  # dim_relative reads an off light as zero and the clamp lifts it to the floor.
   - platform: fan_rf
     name: "Remote: brightness down"
     key: bright_down
@@ -347,17 +355,6 @@ binary_sensor:
 # Commands originated here rather than relayed. `key` takes any name from
 # PROTOCOL.md section 4, or a raw 0-31 value, and can be templated.
 button:
-  # Flicker diagnostic: the radio is the largest current step on the 3V3 rail
-  # the opto drive shares. The remote keeps working with it down -- the decode
-  # path is RMT and never touches the network stack -- and it re-enables
-  # itself, so there is no way to strand the board.
-  - platform: template
-    name: "Diagnostic: radio off 30 min"
-    on_press:
-      - wifi.disable:
-      - delay: 30min
-      - wifi.enable:
-
   - platform: template
     name: "Fan: off"
     on_press:
