@@ -4,7 +4,7 @@
 # reconstructed commands into the OEM MCU's RF input (GPIO5), so every fan
 # button still works while the ESP32 sits in the middle of the path. The six
 # light keys stop here instead: the ESP32 drives the two dimming optocouplers
-# itself (GPIO7, GPIO10) and the light is one CWWW entity in Home Assistant.
+# itself (GPIO7, GPIO10) and the light is one CWWW entity.
 #
 # REQUIRES THE BOARD MODIFIED, both modifications:
 #   - the `102` between the RF receiver output and the MCU input removed, and a
@@ -20,22 +20,22 @@
 # source is asserting low wins and the MCU sees a mixture of the two.
 
 # --- bring-up knobs --------------------------------------------------------
-# Nothing below has met hardware. The LED bring-up procedure in README.md is
-# how each one gets settled.
+# Settled against hardware except where a comment says otherwise. What is still
+# open is in README.md.
 substitutions:
-  # Optocoupler polarity, UNVERIFIED: nobody has established whether more
-  # current through the PC817 means brighter or dimmer at the MT9722S dim
-  # input. `false` = more duty is brighter. Flip to `true` if the light comes
-  # up brightest with the slider at the bottom. Both channels are wired the
-  # same way, so both move together.
+  # Optocoupler polarity, MEASURED: more current through the PC817 is brighter
+  # at the MT9722S dim input, so `false`. Both channels are wired the same way
+  # and move together.
   led_inverted: "false"
 
   # The duty a channel sits at when it is on but asked for the least possible.
-  # At 1 kHz, 1% is a 10 us pulse and the PC817's practical minimum is roughly
-  # 10-20 us, so this is on the bottom edge of what the opto is expected to
-  # pass rather than comfortably inside it: a value to measure from, not a
-  # validated one. Per channel, because the two optocouplers are separate parts
-  # and need not share a floor.
+  # STILL UNMEASURED, and the one knob with real dimming range left in it. At
+  # 250 Hz, 1% is a 40 us pulse, which is known to produce plenty of light --
+  # the driver's minimum pulse width is bracketed between 10 us (too short, at
+  # 1 kHz) and that 40 us, so there may be up to another 4x of range below
+  # here. Sweep down -- 0.5%, 0.3%, 0.2% -- and find where the light stops
+  # getting dimmer; this belongs just above that. Per channel, because the two
+  # optocouplers are separate parts and need not share a floor.
   min_power_r37: "1%"
   min_power_r38: "1%"
 
@@ -186,9 +186,10 @@ fan_rf:
   # else is forwarded, including the five keys whose side of the fan has never
   # been verified.
   #
-  # THIS SETTING AND THE R37/R38 REMOVAL ARE ONE CHANGE. Until those resistors
-  # are out, the ESP32 is not connected to the optocouplers and `fan` leaves
-  # the light with nothing driving it: the MCU stops hearing the light keys and
+  # THIS SETTING AND THE R37/R38 REMOVAL ARE ONE CHANGE, which matters to
+  # anyone rebuilding this from an unmodified board: until those resistors are
+  # out, the ESP32 is not connected to the optocouplers and `fan` leaves the
+  # light with nothing driving it -- the MCU stops hearing the light keys and
   # the PWM on GPIO7/GPIO10 goes nowhere. Run `all` until the board is cut.
   relay: fan
 
@@ -197,10 +198,10 @@ fan_rf:
   # where the first repeat of a held button lands. See fan_rf/__init__.py.
   relay_decision: 230ms
 
-  # Frames one tap injects. UNVERIFIED whether the MCU accepts a single frame:
-  # the remote sends five, but that redundancy is for a noisy RF link and this
-  # goes over a wire. Raise it if one turns out not to be enough — and raise
-  # remote_transmitter's rmt_symbols with it.
+  # Frames one tap injects. One is enough: the fan keys tap through to the MCU
+  # at this setting, on hardware. The remote sends five, but that redundancy is
+  # for a noisy RF link and this goes over a wire. Raise it if a tap ever turns
+  # out to be dropped — and raise remote_transmitter's rmt_symbols with it.
   tap_frames: 1
 
 # Diagnostics. An ESP32 reset takes the GPIOs high-Z, which drops the drive to
@@ -262,10 +263,8 @@ light:
     id: led_light
     name: "Light"
 
-    # WHICH PAD IS THE WARM CHANNEL IS UNVERIFIED. The README pins GPIO7 to
-    # R37 and GPIO10 to R38; nothing says which driver is which colour. If the
-    # light runs cold where Home Assistant says warm, swap these two ids and
-    # change nothing else.
+    # MEASURED by observation: R38 (GPIO10) is the cold channel and R37
+    # (GPIO7) the warm one.
     cold_white: led_r38
     warm_white: led_r37
 

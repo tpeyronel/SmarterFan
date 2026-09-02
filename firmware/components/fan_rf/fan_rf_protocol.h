@@ -408,9 +408,9 @@ inline size_t build_frame(uint8_t key, uint8_t counter, int32_t *out, size_t cap
 // Read off the button names in PROTOCOL.md section 4, never computed: KEY is a
 // lookup table and nothing in a code predicts what it does.
 //
-// The relay forwards everything today. It narrows to the fan only once the
-// ESP32 drives the LEDs itself, which does not exist yet -- so this exists to
-// make that a config change rather than a rewrite.
+// The relay runs in `fan` mode: the ESP32 drives the LEDs itself, so the light
+// keys stop there and only the fan half is forwarded. `all` forwards
+// everything, which is what an unmodified LED path needs.
 enum KeyDomain : uint8_t {
   DOMAIN_FAN,
   DOMAIN_LIGHT,
@@ -506,8 +506,8 @@ static const uint32_t DEFAULT_DECISION_DELAY_MS = 230;
 // Frames a tap injects. The remote sends five, but that redundancy buys margin
 // on a noisy RF link and injection is over a wire.
 //
-// UNVERIFIED: whether the MCU accepts a single frame has not been tested. Raise
-// this if it turns out to want more.
+// One is enough: the fan keys tap through to the MCU at this setting, on
+// hardware. Raise this if a tap is ever dropped.
 static const uint8_t DEFAULT_TAP_FRAMES = 1;
 
 struct InjectPlan {

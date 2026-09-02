@@ -178,8 +178,8 @@ CONFIG_SCHEMA = (
             ): cv.positive_time_period_milliseconds,
             # Frames one injected tap sends. The remote sends five, but that
             # redundancy buys margin on a noisy RF link and this goes over a
-            # wire. UNVERIFIED -- nobody has asked the MCU whether one is
-            # enough. Raise it if one turns out not to be.
+            # wire. One is enough: the fan keys tap through to the MCU at this
+            # setting, on hardware. Raise it if a tap is ever dropped.
             cv.Optional(CONF_TAP_FRAMES, default=1): cv.int_range(min=1, max=8),
             cv.Optional(CONF_ON_CODE): automation.validate_automation(
                 {cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(FanRfCodeTrigger)}
