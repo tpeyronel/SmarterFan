@@ -57,7 +57,7 @@ logger:
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
-  output_power: 10db
+  output_power: 8.5db
   power_save_mode: none
 
   # Static, because Home Assistant runs off-site and reaches the device over a
