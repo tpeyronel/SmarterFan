@@ -57,7 +57,7 @@ logger:
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
-  output_power: 12db
+  output_power: 10db
 
   # Static, because Home Assistant runs off-site and reaches the device over a
   # VPN. mDNS does not cross the tunnel, so `smarterfan-relay.local` does not
