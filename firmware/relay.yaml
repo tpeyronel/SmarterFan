@@ -34,17 +34,43 @@ substitutions:
   # also passed to the brightness_step script, whose parameter is a float.
   dim_step: "0.02"
 
-  # Floor a hold stops at: dim_relative switches the light off at zero, and
-  # `light on/off` / `all off` are the buttons for that.
-  dim_floor: "1%"
+  # Floor a hold stops at, and where the sunrise fade begins: dim_relative
+  # switches the light off at zero, and `light on/off` / `all off` are the
+  # buttons for that. A fraction rather than "1%" because the sunrise lambdas
+  # need it as a C++ literal; ESPHome's percentage validator takes either form.
+  dim_floor: "0.01"
 
   # One colour temperature step, as a fraction of the mireds range, so the
   # sweep stays ~2 s whatever the Kelvin endpoints below become.
   ct_step: "0.02"
 
+  # IANA name, set explicitly rather than left to ESPHome's autodetect -- which
+  # reads the clock of whatever machine ran the compile. The sunrise alarm is a
+  # wall-clock comparison, so a wrong zone is a fade an hour out, not an error.
+  # Home Assistant's own timezone has to agree with this one.
+  timezone: "America/Argentina/Buenos_Aires"
+
+  # One step of the sunrise fade, and the transition length of that step, so
+  # the light interpolates across the gap instead of stepping over it. Shorter
+  # is not smoother -- the transition already covers it -- only more state
+  # updates: 5 s is ~360 across a half-hour fade where 1 s would be 1800.
+  sunrise_tick: "5s"
+
+  # `Sunrise: test` runs the entire curve in this many seconds.
+  sunrise_test_seconds: "60"
+
 esphome:
   name: smarterfan-relay
   friendly_name: SmarterFan Relay
+
+  # `Sunrise progress` is publish-only -- the fade pushes it and nothing polls
+  # it -- so without this it reads "unknown" until the first sunrise ever runs.
+  on_boot:
+    priority: -100
+    then:
+      - sensor.template.publish:
+          id: sunrise_progress
+          state: 0.0
 
 esp32:
   board: esp32-c3-devkitm-1
@@ -212,6 +238,19 @@ sensor:
     name: "WiFi signal"
     update_interval: 60s
 
+  # Publish-only: the fade pushes a value every step and zero when it stops, so
+  # an idle device is not sending a percentage every few seconds. This is the
+  # only visibility into a process that runs for half an hour before dawn and
+  # touches exactly one entity.
+  - platform: template
+    id: sunrise_progress
+    name: "Sunrise progress"
+    icon: mdi:weather-sunset-up
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    update_interval: never
+    entity_category: diagnostic
+
 # --- fan: the six OEM speeds -----------------------------------------------
 # Optimistic, because there is nothing to be optimistic against: the MCU never
 # reports its state and the injection path is one-way into it. What this entity
@@ -241,6 +280,51 @@ globals:
     type: int
     restore_value: false
     initial_value: '0'
+
+  # --- sunrise alarm ---
+  # The fade's clock is millis(), not the wall clock. The wall clock decides
+  # when to start and is not consulted again, so an SNTP correction landing
+  # mid-fade cannot jump the light.
+  - id: sunrise_active
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+  - id: sunrise_t0_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+
+  - id: sunrise_span_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+
+  # The alarm this session has already acted on, as an epoch. Written when a
+  # sunrise arms and left written when one is cancelled, which is what makes a
+  # cancel final for that alarm instead of something the next tick undoes.
+  #
+  # Not restored, deliberately: after a reboot mid-fade the window test matches
+  # again and the sunrise resumes where it left off, rather than the light
+  # staying dark for the rest of the morning.
+  - id: sunrise_handled
+    type: int64_t
+    restore_value: false
+    initial_value: '0'
+
+  # What the last step commanded -- the same shadow trick the fan entity uses
+  # above. The light's on_state fires for every change including the fade's
+  # own, and what separates a person from the fade is whether the value that
+  # got published is the one the step had just written here.
+  - id: sunrise_shadow_brightness
+    type: float
+    restore_value: false
+    initial_value: '0.0f'
+
+  - id: sunrise_shadow_mireds
+    type: float
+    restore_value: false
+    initial_value: '0.0f'
 
 fan:
   - platform: template
@@ -339,6 +423,157 @@ light:
     # light back on when a blackout ends.
     restore_mode: RESTORE_DEFAULT_OFF
 
+    # Touching the light during a sunrise ends the sunrise. There is no list of
+    # sources to keep current, because every one of them -- the remote's light
+    # keys, the buttons below, a Home Assistant slider, the web page -- arrives
+    # here as a published state. What separates them from the fade's own steps
+    # is the shadow, written immediately before each step's light.control.
+    #
+    # on_state fires once per light call, with remote_values already holding
+    # the target of the transition rather than an interpolated value, so the
+    # comparison is exact and a running fade does not trip it. The tolerances
+    # are wide enough for any rounding on the way through LightCall and far
+    # narrower than one press of a brightness or temperature key.
+    on_state:
+      - lambda: |-
+          if (!id(sunrise_active))
+            return;
+          const auto &v = id(led_light).remote_values;
+          if (!v.is_on() ||
+              fabsf(v.get_brightness() - id(sunrise_shadow_brightness)) > 0.002f ||
+              fabsf(v.get_color_temperature() - id(sunrise_shadow_mireds)) > 1.0f) {
+            id(sunrise_cancel).execute();
+          }
+
+# --- sunrise alarm ---------------------------------------------------------
+# The fade runs here rather than in Home Assistant, and HA's only job is to
+# keep `Alarm time` pointing at the phone's next alarm. Everything after that
+# -- when to start, the curve, where it ends -- is on the ESP32, so a Wi-Fi or
+# Home Assistant outage between setting the alarm at night and waking up in the
+# morning costs nothing. Same reasoning as the RF relay: the job that matters
+# must not go through the network stack.
+#
+# docs/homeassistant.md has the one HA automation that mirrors an Android alarm
+# into `Alarm time`, and what it needs from the companion app.
+
+time:
+  # The whole feature is a wall-clock comparison, so the clock has to be right
+  # and it has to survive Home Assistant being unreachable. Both platforms set
+  # the system clock and `id(rtc).now()` reads that, so either alone is enough:
+  # SNTP if the LAN has a route to the internet, Home Assistant if only the VPN
+  # is up. Neither is a given here, which is why both are configured.
+  - platform: sntp
+    id: rtc
+    timezone: ${timezone}
+
+  - platform: homeassistant
+    id: rtc_ha
+    timezone: ${timezone}
+
+datetime:
+  # The wake time, as a Home Assistant `datetime` entity. A standard entity
+  # rather than a custom API action, so HA writes it with `datetime.set_value`
+  # and nothing bespoke has to exist on the HA side -- and so it is settable by
+  # hand from the device's own web page when there is no HA at all.
+  #
+  # Wall clock, not an epoch: what is stored is Y/M/D h:m:s in ${timezone},
+  # which is what HA sends and what `state_as_esptime()` turns back into an
+  # epoch for the comparison. HA's timezone and ${timezone} have to agree.
+  - platform: template
+    id: alarm_time
+    name: "Alarm time"
+    type: datetime
+    optimistic: true
+    # Survives a reboot, which is the point of putting it here: an OTA or a
+    # watchdog at 03:00 must not lose the alarm. A restored time already in the
+    # past simply never fires -- what arms the fade is a window, not a
+    # "later than".
+    restore_value: true
+
+switch:
+  # The master enable. Off and the arming check returns immediately, so a
+  # restored alarm time sits there inert rather than needing to be cleared.
+  - platform: template
+    id: sunrise_enabled
+    name: "Sunrise alarm"
+    icon: mdi:weather-sunset-up
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    entity_category: config
+
+number:
+  # How far before the alarm the light starts.
+  - platform: template
+    id: sunrise_duration
+    name: "Sunrise duration"
+    icon: mdi:timer-sand
+    unit_of_measurement: min
+    min_value: 1
+    max_value: 120
+    step: 1
+    initial_value: 30
+    restore_value: true
+    optimistic: true
+    mode: box
+    entity_category: config
+
+  # Where the fade ends. 100% at the default colour temperature below is the
+  # full 56 W.
+  - platform: template
+    id: sunrise_end_brightness
+    name: "Sunrise end brightness"
+    icon: mdi:brightness-7
+    unit_of_measurement: "%"
+    # Not 0: a sunrise that ends dark is a disabled sunrise, and there is a
+    # switch for that. The bottom of the range is roughly `night mode`.
+    min_value: 5
+    max_value: 100
+    step: 1
+    initial_value: 100
+    restore_value: true
+    optimistic: true
+    mode: slider
+    entity_category: config
+
+  # Where the colour ends. The fade always starts at the warmest the light can
+  # do and runs to here.
+  #
+  # 3800 K is the default because it is the middle of the mireds range, and the
+  # middle is where BOTH channels reach full: the cwww mix normalises by the
+  # larger fraction, so total output peaks there and falls away toward either
+  # end. 6500 K is the cold channel alone -- bluer, and about half the light.
+  # See README > How it works.
+  - platform: template
+    id: sunrise_end_kelvin
+    name: "Sunrise end colour temperature"
+    icon: mdi:temperature-kelvin
+    unit_of_measurement: K
+    # The endpoints the light itself declares. Anything outside is clamped to
+    # the mireds range when the step runs, so these only shape the slider.
+    min_value: 2700
+    max_value: 6500
+    step: 100
+    initial_value: 3800
+    restore_value: true
+    optimistic: true
+    mode: box
+    entity_category: config
+
+# One timer for both halves of the feature: while a sunrise runs this is the
+# fade's clock, and the rest of the time it is the arming check. Arming is a
+# handful of comparisons, so polling it costs nothing and there is no timer to
+# schedule, cancel or lose when the alarm time changes.
+interval:
+  - interval: ${sunrise_tick}
+    then:
+      - if:
+          condition:
+            lambda: 'return id(sunrise_active);'
+          then:
+            - script.execute: sunrise_step
+          else:
+            - script.execute: sunrise_arm
+
 # ESPHome has light.dim_relative but no colour temperature equivalent.
 script:
   - id: colour_temp_step
@@ -423,6 +658,131 @@ script:
           auto call = id(fan_motor).make_call();
           call.set_direction(reverse ? fan::FanDirection::REVERSE : fan::FanDirection::FORWARD);
           call.perform();
+
+  # --- sunrise alarm ---
+  # Is now inside a sunrise window, and if so, claim it. Runs on every tick
+  # that a fade is not already running.
+  - id: sunrise_arm
+    mode: single
+    then:
+      - lambda: |-
+          if (!id(sunrise_enabled).state)
+            return;
+          // Never set, or the entity is not restored yet: nothing to wake for.
+          if (!id(alarm_time).has_state() || !id(sunrise_duration).has_state())
+            return;
+          const auto now = id(rtc).now();
+          // No clock yet. SNTP and Home Assistant both take a few seconds
+          // after boot, and comparing against an unset clock would fire the
+          // fade at a time that means nothing.
+          if (!now.is_valid())
+            return;
+
+          const int64_t alarm = (int64_t) id(alarm_time).state_as_esptime().timestamp;
+          // One sunrise per alarm. Set below when a fade arms, so a cancel --
+          // or a skip -- is final until Home Assistant pushes the next alarm.
+          if (alarm == id(sunrise_handled))
+            return;
+
+          const int64_t span = (int64_t) (id(sunrise_duration).state * 60.0f);
+          const int64_t start = alarm - span;
+          const int64_t t = (int64_t) now.timestamp;
+          // A window, not a deadline. An alarm restored from before a reboot,
+          // or one Home Assistant pushes for tomorrow, is simply not in it,
+          // and neither is the rest of the morning after the alarm passes.
+          if (t < start || t >= alarm)
+            return;
+
+          id(sunrise_handled) = alarm;
+
+          // An alarm has no business dimming a room somebody is sitting in.
+          // At or below the floor counts as off: that is where the fade would
+          // start anyway, and where `night mode` leaves the light.
+          if (id(led_light).remote_values.is_on() &&
+              id(led_light).remote_values.get_brightness() > ${dim_floor} + 0.001f) {
+            ESP_LOGI("sunrise", "in window, but the light is already on -- skipping");
+            return;
+          }
+
+          // Start from where the clock says rather than from zero. This is
+          // also the path a reboot mid-fade comes back in through, and it has
+          // to resume the sunrise, not restart it.
+          id(sunrise_span_ms) = (uint32_t) (span * 1000);
+          id(sunrise_t0_ms) = millis() - (uint32_t) ((t - start) * 1000);
+          id(sunrise_active) = true;
+          ESP_LOGI("sunrise", "starting, %d s of fade to the alarm", (int) (alarm - t));
+      - if:
+          condition:
+            lambda: 'return id(sunrise_active);'
+          then:
+            # Straight into the first step rather than waiting a tick, so a
+            # resumed fade jumps to its true position immediately.
+            - script.execute: sunrise_step
+
+  # One step of the fade, and the whole of it: nothing is precomputed, so the
+  # duration and both endpoints can be changed while a sunrise is running and
+  # the next step picks them up.
+  - id: sunrise_step
+    mode: single
+    then:
+      - lambda: |-
+          // Unsigned, so this stays correct across the 49.7-day millis() wrap.
+          const uint32_t elapsed = millis() - id(sunrise_t0_ms);
+          const float p = id(sunrise_span_ms) == 0
+                              ? 1.0f
+                              : clamp((float) elapsed / (float) id(sunrise_span_ms), 0.0f, 1.0f);
+
+          auto traits = id(led_light).get_traits();
+          const float warmest = traits.get_max_mireds();
+          const float target = clamp(1000000.0f / id(sunrise_end_kelvin).state,
+                                     traits.get_min_mireds(), warmest);
+
+          // Linear in the light's brightness *state*, and deliberately no
+          // curve on top of it. The light's own gamma_correct (2.8, the
+          // default) is what bends this into a ramp that looks linear: output
+          // goes as p^2.8, close enough to the cube law between luminance and
+          // perceived lightness. Squaring it as well would leave the first
+          // twenty minutes doing nothing visible.
+          id(sunrise_shadow_brightness) =
+              ${dim_floor} + p * (id(sunrise_end_brightness).state / 100.0f - ${dim_floor});
+          // Warmest to target, so the room reddens before it brightens.
+          id(sunrise_shadow_mireds) = warmest + p * (target - warmest);
+
+          // Zero means idle, whether the fade finished or was cancelled, so
+          // the sensor answers "is a sunrise running, and how far in" and can
+          // be used as a condition. The cost is that it never shows 100 -- the
+          // log line below is what says a fade ran to the end.
+          id(sunrise_progress).publish_state(p >= 1.0f ? 0.0f : p * 100.0f);
+
+          // Cleared BEFORE the light call below, not after: the on_state hook
+          // on the light ignores changes while this is false, and the last
+          // step must not be mistaken for somebody reaching for a slider.
+          if (p >= 1.0f) {
+            id(sunrise_active) = false;
+            ESP_LOGI("sunrise", "complete");
+          }
+      - light.control:
+          id: led_light
+          state: true
+          brightness: !lambda 'return id(sunrise_shadow_brightness);'
+          color_temperature: !lambda 'return id(sunrise_shadow_mireds);'
+          # Exactly one tick: each step is still transitioning when the next
+          # one arrives, so the light interpolates continuously and never
+          # actually steps. This is why ${sunrise_tick} can be seconds long.
+          transition_length: ${sunrise_tick}
+
+  # Stop the fade and leave the light exactly where it is -- whoever cancelled
+  # it has just put it somewhere. `sunrise_handled` is untouched on purpose: it
+  # was written when the sunrise armed, so this alarm stays done and the next
+  # tick will not start it over.
+  - id: sunrise_cancel
+    then:
+      - lambda: |-
+          if (!id(sunrise_active))
+            return;
+          id(sunrise_active) = false;
+          id(sunrise_progress).publish_state(0.0f);
+          ESP_LOGI("sunrise", "cancelled");
 
 # The light keys, acted on here since `relay: fan` drops them. `repeats` stays
 # on where a hold should ramp, off where it should register once.
@@ -680,3 +1040,25 @@ button:
     name: "Light: night mode"
     on_press:
       - script.execute: light_night_mode
+
+  # The whole curve compressed into ${sunrise_test_seconds}, from wherever the
+  # light is now and ignoring the alarm entirely. The real thing takes half an
+  # hour and happens before dawn, which is not a thing to debug in place.
+  #
+  # It does not touch `sunrise_handled`, so testing does not consume the
+  # morning's alarm.
+  - platform: template
+    name: "Sunrise: test"
+    on_press:
+      - lambda: |-
+          id(sunrise_span_ms) = ${sunrise_test_seconds} * 1000;
+          id(sunrise_t0_ms) = millis();
+          id(sunrise_active) = true;
+      - script.execute: sunrise_step
+
+  # For stopping one without moving the light. Touching the light does this
+  # too, and is what usually will -- see the light's on_state above.
+  - platform: template
+    name: "Sunrise: cancel"
+    on_press:
+      - script.execute: sunrise_cancel

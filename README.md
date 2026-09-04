@@ -4,7 +4,7 @@ Replacing the brain of a **Novohome NH-VTR500** ceiling fan (retractable blades,
 
 The stock firmware is locked in an undocumented mask-ROM MCU: the lowest brightness step is still uncomfortably bright, there are three fixed colour temperatures, and the only way in is the handheld remote. This project intercepts the two control paths that matter — the LED dimming lines and the RF receiver's output — and leaves the rectifier, LED drivers, isolation barrier and motor stage exactly as built.
 
-**Status:** installed and running in the fan. Both interventions are done and confirmed on hardware — the ESP32 drives the LEDs far below the OEM floor, and fan commands relay through it to the OEM MCU. The remote still works. What remains is measurement, not construction: see [Still open](#still-open).
+**Status:** installed and running in the fan. Both interventions are done and confirmed on hardware — the ESP32 drives the LEDs far below the OEM floor, and fan commands relay through it to the OEM MCU. The remote still works. The sunrise alarm is written and validated but has not yet run against a real morning. What else remains is measurement, not construction: see [Still open](#still-open).
 
 ---
 
@@ -164,7 +164,7 @@ ESPHome. Two builds, both loading local components from `firmware/components`:
 | Build | Needs | Does |
 |---|---|---|
 | `firmware/sniffer.yaml` | just the sniff tap — **no board modification** | Decodes the remote and prints it. Receive-only; this is the bring-up config. |
-| `firmware/relay.yaml` | **both** modifications | The same decode, plus injection into the MCU's RF input, `fan_rf.send_key` for automations, the two LED channels as a `cwww` light driven from the remote's light keys, and a `web_server` page on the device. |
+| `firmware/relay.yaml` | **both** modifications | The same decode, plus injection into the MCU's RF input, `fan_rf.send_key` for automations, the two LED channels as a `cwww` light driven from the remote's light keys, the [sunrise alarm](#sunrise-alarm), and a `web_server` page on the device. |
 
 | Component | Does |
 |---|---|
@@ -279,6 +279,7 @@ Three properties shape everything else:
 
 ### Still open
 
+- [ ] **The sunrise alarm against a real morning.** The config validates and builds, and `Sunrise: test` exercises the whole curve, but nothing has yet armed off a phone alarm and run the full half hour unattended. First thing to check is that the clock is actually set — `sntp` needs a route out of the LAN and `homeassistant` needs the VPN up.
 - [ ] **Stroboscopic beating between the 250 Hz dim PWM and the blades**, at each of the six fan speeds. The one thing that could force the carrier back up.
 - [ ] **Whether 250 Hz is flicker-free for other people.** It is the measured threshold, not a value with margin.
 - [ ] **How far the 24 V bus rises when the motor decelerates.** The MP1584 is a 28 V part with a 30 V absolute maximum, so the headroom is ~4 V and the failure mode is not graceful — see [Power](#power). Scope the bus across a 6→off transition at the buck's input.
@@ -294,7 +295,7 @@ Three properties shape everything else:
 
 `web_server:` in `relay.yaml` serves `http://smarterfan-relay.local/` with a control for every entity — no server, no hub, nothing to maintain, and it is the whole interface if nothing else is set up. State only, no automations, unauthenticated unless `auth:` is added.
 
-**Home Assistant** is the richer option and essentially free from ESPHome: a `light` with brightness and colour temperature, a `fan` with the six OEM speeds, and HA automations for the sunrise alarm. Note the CCT slider is one-dimensional and normalised, so it cannot express every pair of channel levels — "warm at 100%, cool at 40%" is not a point on it. `light.control` with explicit `cold_white:`/`warm_white:` still reaches those. One entity is the right number; a second for the raw channels would be two lights fighting over the same hardware.
+**Home Assistant** is the richer option and essentially free from ESPHome: a `light` with brightness and colour temperature, a `fan` with the six OEM speeds, and the handful of entities the [sunrise alarm](#sunrise-alarm) needs. Note the CCT slider is one-dimensional and normalised, so it cannot express every pair of channel levels — "warm at 100%, cool at 40%" is not a point on it. `light.control` with explicit `cold_white:`/`warm_white:` still reaches those. One entity is the right number; a second for the raw channels would be two lights fighting over the same hardware.
 
 ### The entities
 
@@ -306,11 +307,73 @@ Three properties shape everything else:
 | `button` **Light: …** | The six light keys — brightness ±, warmer/cooler, full brightness, night mode |
 | `binary_sensor` **Remote: …** | Momentary, one per light key: what the handheld remote is doing |
 | `binary_sensor` **Custom: …** | `natural wind`, `2H`, `4H` — the three [claimed keys](#press-hold-and-relay), actionless and waiting for an automation |
-| Diagnostic | Uptime, reset reason, Wi-Fi signal |
+| `datetime` **Alarm time** | What the [sunrise](#sunrise-alarm) runs up to. Written by Home Assistant from the phone's next alarm, and settable by hand from the web page |
+| `switch` **Sunrise alarm** | Master enable. Off and nothing arms, whatever **Alarm time** says |
+| `number` **Sunrise …** | Duration, end brightness, end colour temperature |
+| `button` **Sunrise: …** | Test — the whole curve in a minute — and cancel |
+| Diagnostic | Uptime, reset reason, Wi-Fi signal, sunrise progress |
 
 **The fan entity is optimistic, and cannot be anything else.** The MCU reports nothing and the injection path is one-way into it, so the entity holds the last command anyone is known to have sent, not a reading. Two things keep that close to the truth: presses of the handheld remote are decoded here anyway, so they are mirrored into the entity as they go past, and each **Fan:** button transmits its key unconditionally — the entity itself sends nothing when asked for the state it already claims. Nothing is restored across a restart and nothing is transmitted at boot, so after an ESP32-only restart (an OTA, a watchdog) the entity reads off while the fan runs; any **Fan:** button, or one press of the remote, puts the two back together.
 
 Speed and direction are separate keys, so a single call that changes both transmits two frames back to back — the second waits out the first, about 41 ms.
+
+### Sunrise alarm
+
+The light ramps from its dimmest and warmest up to full across the half hour
+before your alarm goes off. **The fade runs on the ESP32**, and Home Assistant's
+only job is to keep one `datetime` entity pointing at the phone's next alarm.
+
+That is the same split as the RF relay, for the same reason. The alarm is set at
+night, when the phone and Home Assistant are both awake and talking; the sunrise
+happens hours later, when nothing but the ESP32 needs to be. A router that dies
+at 03:00 costs nothing.
+
+**The Android side is `AlarmManager`, by way of the Home Assistant Companion
+app's `Next alarm` sensor** — an OS-level call that returns the next alarm
+registered by *any* app, so Google Clock, the Samsung and Xiaomi clocks and
+Sleep as Android all work with no per-app configuration and nothing installed
+beyond the companion app most people already have. No webhook, no cloud, no
+third-party service in the path. The sensor ships **disabled**;
+**[docs/homeassistant.md](docs/homeassistant.md)** is the setup, the one
+automation it needs, and the caveats.
+
+Nothing about the fade is compiled in — duration, end brightness and end colour
+temperature are `number` entities, and `Sunrise: test` runs the whole curve in a
+minute so it can be judged without waiting for dawn.
+
+| | |
+|---|---|
+| **Curve** | Linear in the light's brightness *state*, with deliberately nothing on top. The light's `gamma_correct` of 2.8 already bends output as p<sup>2.8</sup> — close enough to the cube law between luminance and perceived lightness that the ramp *looks* linear. A second curve would leave the first twenty minutes doing nothing visible. |
+| **Colour** | Warmest → the end colour temperature, so the room reddens before it brightens. The 3800 K default is the **middle of the mireds range, where both channels reach full** and total output peaks. 6500 K is the cold channel alone: bluer, and about half the light. |
+| **Steps** | One every 5 s, each with a 5 s transition, so the light interpolates continuously between them rather than stepping. That is ~360 state updates across a half hour where 1 Hz would be 1800, at identical smoothness. |
+| **Ending one** | Any brightness or colour change during a fade cancels it — the remote, a button, a Home Assistant slider, the web page. There is no list of sources to maintain: they all arrive at the light's `on_state`, and what separates them from the fade's own steps is a shadow variable, the same trick the [fan entity](#the-entities) uses. |
+| **Not starting one** | A sunrise will not start if the light is already on above its floor. An alarm has no business dimming a room somebody is sitting in. |
+| **A reboot mid-fade** | Resumes at the right point rather than restarting or giving up. `Alarm time` is restored across a restart; the "already handled" marker deliberately is not. |
+| **The clock** | `sntp` **and** `homeassistant`, both configured. Either alone is enough — both set the system clock — and neither is a given here, with Home Assistant off-site behind a VPN and no promise of a route to the internet on the LAN. |
+
+The defaults, then, put a 30-minute fade here — `duty` being what the
+optocoupler actually sees, after the light's gamma and the 0.1% `min_power`
+floor:
+
+| min | brightness state | duty | colour |
+|---:|---:|---:|---:|
+| 0 | 0.010 | **0.10%** — the measured floor | 2700 K |
+| 5 | 0.175 | 0.86% | 2837 K |
+| 10 | 0.340 | 4.97% | 2988 K |
+| 15 | 0.505 | 14.85% | 3157 K |
+| 20 | 0.670 | 32.65% | 3346 K |
+| 25 | 0.835 | 60.40% | 3558 K |
+| 30 | 1.000 | 100% | 3800 K |
+
+Barely there for the first ten minutes, most of the work in the last third.
+That is the gamma doing it, not a curve in the config.
+
+One thing has to be got right: **`timezone:` in `relay.yaml` and Home
+Assistant's own timezone must name the same zone.** The device stores wall-clock
+time, not an epoch. They disagree silently, and the symptom is a sunrise a whole
+number of hours out.
+
+### Matter
 
 **Matter** would let Apple/Google/Alexa drive the fan without HA, but **ESPHome has no Matter component** (checked against 2026.8.0, which ships `openthread` and nothing that speaks Matter), so it is a different firmware stack rather than a config change — and Matter still needs a commercial hub as controller. The C3 is Wi-Fi only in any case; Thread would need a C6 or H2.
 
