@@ -743,6 +743,46 @@ static void check_key_domains() {
   check(relay_key(RELAY_FAN, 0), "relay: fan forwards an unlisted key");
 }
 
+static void check_fan_speeds() {
+  printf("-- speed <-> key --\n");
+
+  // Transcribed from PROTOCOL.md section 4, independently of key_for_speed():
+  // asserting the mapping against the switch that defines it would assert
+  // nothing. The codes do not run in speed order, which is the whole reason
+  // this is a table.
+  static const uint8_t SPEED_KEY[] = {KEY_FAN_OFF, KEY_FAN_1, KEY_FAN_2, KEY_FAN_3,
+                                      KEY_FAN_4,   KEY_FAN_5, KEY_FAN_6};
+  const int speeds = (int) (sizeof(SPEED_KEY) / sizeof(SPEED_KEY[0]));
+  checkf(speeds == FAN_SPEED_COUNT + 1, "%d speeds plus off", (int) FAN_SPEED_COUNT);
+
+  for (int speed = 0; speed < speeds; speed++) {
+    checkf(key_for_speed((uint8_t) speed) == SPEED_KEY[speed], "speed %d selects %s", speed,
+           key_name(SPEED_KEY[speed]));
+    checkf(speed_for_key(SPEED_KEY[speed]) == speed, "%s reads back as speed %d",
+           key_name(SPEED_KEY[speed]), speed);
+    // Every speed key is a fan key, or the entity would be driving something
+    // the relay does not forward to the MCU.
+    checkf(key_domain(SPEED_KEY[speed]) == DOMAIN_FAN, "%s is a fan key",
+           key_name(SPEED_KEY[speed]));
+  }
+
+  // Out of range stops the fan rather than picking a speed at random.
+  check(key_for_speed(7) == KEY_FAN_OFF, "speed 7 falls back to fan off");
+  check(key_for_speed(255) == KEY_FAN_OFF, "speed 255 falls back to fan off");
+
+  // `all off` stops the fan too, so a fan entity mirroring the remote has to
+  // hear it -- but it is not what speed 0 transmits, since it kills the light.
+  check(speed_for_key(KEY_ALL_OFF) == 0, "all off reads as speed 0");
+  check(key_for_speed(0) != KEY_ALL_OFF, "speed 0 transmits fan off, not all off");
+
+  // Everything that is not a speed says so, direction and light keys included.
+  check(speed_for_key(KEY_FAN_FORWARD) == -1, "fan forward is not a speed");
+  check(speed_for_key(KEY_FAN_REVERSE) == -1, "fan reverse is not a speed");
+  check(speed_for_key(KEY_LIGHT_TOGGLE) == -1, "light on/off is not a speed");
+  check(speed_for_key(KEY_NATURAL_WIND) == -1, "natural wind is not a speed");
+  check(speed_for_key(0) == -1, "an unlisted key is not a speed");
+}
+
 // --- log replay (diagnostic) ------------------------------------------------
 
 struct Capture {
@@ -927,6 +967,7 @@ int main(int argc, char **argv) {
   check_waveform();
   check_relay_gate();
   check_key_domains();
+  check_fan_speeds();
   printf("\n%d checks, %d failures\n", checks, failures);
 
   if (!paths.empty() && failures == 0)

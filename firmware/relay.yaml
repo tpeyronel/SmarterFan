@@ -28,9 +28,11 @@ substitutions:
   # 250 Hz sits exactly on the measured flicker floor. See README > Dimming.
   pwm_frequency: "0.25kHz"
 
-  # One step of a brightness button. A hold pulses every 41.1 ms, so 2% sweeps
-  # the range in ~2.1 s. A tap is one step of the same size.
-  dim_step: "2%"
+  # One step of a brightness button, as a fraction of full brightness. A hold
+  # pulses every 41.1 ms, so 0.02 sweeps the range in ~2.1 s, and a tap is one
+  # step of the same size. A fraction rather than a percentage because it is
+  # also passed to the brightness_step script, whose parameter is a float.
+  dim_step: "0.02"
 
   # Floor a hold stops at: dim_relative switches the light off at zero, and
   # `light on/off` / `all off` are the buttons for that.
@@ -167,6 +169,27 @@ fan_rf:
   # noisy RF link and this is a wire. Raise rmt_symbols above if you raise it.
   tap_frames: 1
 
+  # The fan half of the remote, mirrored into the Home Assistant entity below.
+  # This is the only feedback path the fan has: the MCU reports nothing, so
+  # without it a press of the handheld remote would leave the entity stale.
+  #
+  # Nothing here transmits. The relay has already forwarded this very press --
+  # `fan_show_*` only moves the entity, and moves the shadow with it so that
+  # on_state does not send it straight back.
+  on_code:
+    - lambda: |-
+        using namespace smarterfan::fan_rf;
+        // The press itself. A held fan key repeats one command, and acting on
+        // the repeats would re-run the same call every 41.1 ms for nothing.
+        if (repeat != 0)
+          return;
+        const int speed = speed_for_key(key);
+        if (speed >= 0) {
+          id(fan_show_speed).execute(speed);
+        } else if (key == KEY_FAN_FORWARD || key == KEY_FAN_REVERSE) {
+          id(fan_show_direction).execute(key == KEY_FAN_REVERSE);
+        }
+
 # A restart takes the GPIOs high-Z and drops both optocouplers for the few
 # hundred ms the light needs to come back, which reads as a flicker. Uptime and
 # reset_reason are how that is told apart from the analogue path after the fact.
@@ -188,6 +211,80 @@ sensor:
   - platform: wifi_signal
     name: "WiFi signal"
     update_interval: 60s
+
+# --- fan: the six OEM speeds -----------------------------------------------
+# Optimistic, because there is nothing to be optimistic against: the MCU never
+# reports its state and the injection path is one-way into it. What this entity
+# holds is the last command anyone is known to have sent -- from Home
+# Assistant, from a button below, or from the handheld remote by way of
+# `on_code` above -- and never a reading of what the motor is doing.
+#
+# The two globals are the other half of that: what was last put on the wire.
+# Every path that commands the fan writes them, and `on_state` transmits only
+# where the entity and the shadow disagree. That is what keeps a mirrored
+# remote press from being echoed back at the MCU it just came from.
+globals:
+  - id: fan_sent_speed
+    type: int
+    restore_value: false
+    # -1 is "nothing sent since boot", so the first thing Home Assistant asks
+    # for goes out even when the entity already claims that state. After an
+    # ESP32-only restart the fan keeps running and this entity does not know
+    # it; that first command is what puts the two back together.
+    initial_value: '-1'
+
+  - id: fan_sent_reverse
+    # Not a bool: -1 unknown, 0 forward, 1 reverse. Starts at 0 rather than -1
+    # because a fan that restores nothing starts the entity at FORWARD, and the
+    # shadow has to agree with it -- otherwise the first command of the session
+    # would carry a direction change nobody asked for.
+    type: int
+    restore_value: false
+    initial_value: '0'
+
+fan:
+  - platform: template
+    id: fan_motor
+    name: "Fan"
+
+    # The OEM's six, no more. Fan speed belongs to the MCU and this build
+    # routes commands through it rather than replacing it -- see
+    # README > Out of scope.
+    speed_count: 6
+
+    # `fan forward` and `fan reverse` are two separate keys, so direction is a
+    # value to set rather than a toggle to pulse.
+    has_direction: true
+
+    # Nothing restored, so a restart publishes nothing and therefore injects
+    # nothing -- neither a command to the MCU nor a claim about a fan this
+    # build cannot read. The price is that the entity reads off/forward until
+    # the next command or the next press of the remote, and that turning it on
+    # without naming a speed starts at 6, which is ESPHome's own reading of
+    # "on" at speed 0.
+    restore_mode: NO_RESTORE
+
+    on_state:
+      - lambda: |-
+          using namespace smarterfan::fan_rf;
+          // Everything that moves the entity lands here -- Home Assistant, the
+          // buttons, the mirrored remote presses -- and only what the shadow
+          // says is unsent has anything left to transmit.
+          const int speed = id(fan_motor).state ? id(fan_motor).speed : 0;
+          if (speed != id(fan_sent_speed)) {
+            id(fan_sent_speed) = speed;
+            id(fan_remote).send_key(key_for_speed((uint8_t) speed));
+          }
+          // One call can change both, and then two keys go out back to back.
+          // The second blocks until the first is off the wire -- one frame and
+          // its gap, 41 ms -- because there is no way to say "speed 3 in
+          // reverse" in one frame. Six speeds and two directions are eight
+          // separate buttons on the remote.
+          const int reverse = id(fan_motor).direction == fan::FanDirection::REVERSE;
+          if (reverse != id(fan_sent_reverse)) {
+            id(fan_sent_reverse) = reverse;
+            id(fan_remote).send_key(reverse ? KEY_FAN_REVERSE : KEY_FAN_FORWARD);
+          }
 
 # --- LED dimming: the two optocouplers -------------------------------------
 # Each GPIO drives a PC817 through 620 Ohm into the pad `R37`/`R38` left
@@ -263,6 +360,70 @@ script:
               cur = (lo + hi) / 2.0f;
             return clamp(cur + delta * (hi - lo), lo, hi);
 
+  # One step of brightness, in either direction. A script rather than four
+  # copies of the action: the remote's two keys and the two buttons below all
+  # want the same step and the same floor.
+  - id: brightness_step
+    parameters:
+      # Signed fraction of full brightness; positive is brighter.
+      delta: float
+    then:
+      - light.dim_relative:
+          id: led_light
+          relative_brightness: !lambda 'return delta;'
+          brightness_limits:
+            min_brightness: ${dim_floor}
+            max_brightness: 100%
+
+  # The two presets, each behind one script for the same reason: the remote key
+  # and the Home Assistant button are the same command from two places.
+  - id: light_full_bright
+    then:
+      - light.turn_on:
+          id: led_light
+          brightness: 100%
+          # Middle of the range: both fractions normalise to 1.0, both LEDs full.
+          color_temperature: !lambda |-
+            auto traits = id(led_light).get_traits();
+            return (traits.get_min_mireds() + traits.get_max_mireds()) / 2.0f;
+
+  - id: light_night_mode
+    then:
+      - light.turn_on:
+          id: led_light
+          brightness: ${dim_floor}
+          color_temperature: !lambda |-
+            return id(led_light).get_traits().get_max_mireds();
+
+  # The fan entity, moved without transmitting anything: what the fan is now
+  # believed to be doing. This is how a press of the handheld remote -- already
+  # forwarded by the relay -- and the raw buttons below keep the entity honest.
+  #
+  # Writing the shadow before the state change is the whole trick: on_state
+  # then finds nothing left to send and the command does not go out twice.
+  - id: fan_show_speed
+    parameters:
+      # 1..6, or 0 for off.
+      speed: int
+    then:
+      - lambda: |-
+          id(fan_sent_speed) = speed;
+          if (speed == 0) {
+            id(fan_motor).turn_off().perform();
+          } else {
+            id(fan_motor).turn_on().set_speed(speed).perform();
+          }
+
+  - id: fan_show_direction
+    parameters:
+      reverse: bool
+    then:
+      - lambda: |-
+          id(fan_sent_reverse) = reverse ? 1 : 0;
+          auto call = id(fan_motor).make_call();
+          call.set_direction(reverse ? fan::FanDirection::REVERSE : fan::FanDirection::FORWARD);
+          call.perform();
+
 # The light keys, acted on here since `relay: fan` drops them. `repeats` stays
 # on where a hold should ramp, off where it should register once.
 binary_sensor:
@@ -272,33 +433,32 @@ binary_sensor:
     name: "Remote: brightness up"
     key: bright_up
     on_press:
-      - light.dim_relative:
-          id: led_light
-          relative_brightness: ${dim_step}
-          brightness_limits:
-            min_brightness: ${dim_floor}
-            max_brightness: 100%
+      - script.execute:
+          id: brightness_step
+          delta: ${dim_step}
 
   - platform: fan_rf
     name: "Remote: brightness down"
     key: bright_down
     on_press:
-      - light.dim_relative:
-          id: led_light
-          relative_brightness: -${dim_step}
-          brightness_limits:
-            min_brightness: ${dim_floor}
-            max_brightness: 100%
+      - script.execute:
+          id: brightness_step
+          delta: -${dim_step}
 
-  # temp+ means cooler, i.e. fewer mireds -- hence the negative delta. Which
-  # way the OEM buttons actually go is unobserved; swap the signs if backwards.
+  # OBSERVED on hardware: temp+ warms the light, temp- cools it. This was
+  # guessed the other way round at first -- the guess was that "+" meant more
+  # Kelvin -- and it is the one place in this file where the two conventions
+  # for "up" collide. The colour_temp_step script works in mireds, where warmer
+  # is a LARGER number and Kelvin runs backwards, so temp+ is a positive delta.
+  #
+  # If a future remote disagrees, this pair of signs is the only thing to swap.
   - platform: fan_rf
     name: "Remote: colour temperature up"
     key: colour_temp_up
     on_press:
       - script.execute:
           id: colour_temp_step
-          delta: -${ct_step}
+          delta: ${ct_step}
 
   - platform: fan_rf
     name: "Remote: colour temperature down"
@@ -306,7 +466,7 @@ binary_sensor:
     on_press:
       - script.execute:
           id: colour_temp_step
-          delta: ${ct_step}
+          delta: -${ct_step}
 
   - platform: fan_rf
     name: "Remote: light toggle"
@@ -320,24 +480,14 @@ binary_sensor:
     key: cycle_full_bright
     repeats: false
     on_press:
-      - light.turn_on:
-          id: led_light
-          brightness: 100%
-          # Middle of the range: both fractions normalise to 1.0, both LEDs full.
-          color_temperature: !lambda |-
-            auto traits = id(led_light).get_traits();
-            return (traits.get_min_mireds() + traits.get_max_mireds()) / 2.0f;
+      - script.execute: light_full_bright
 
   - platform: fan_rf
     name: "Remote: night mode"
     key: night_mode
     repeats: false
     on_press:
-      - light.turn_on:
-          id: led_light
-          brightness: ${dim_floor}
-          color_temperature: !lambda |-
-            return id(led_light).get_traits().get_max_mireds();
+      - script.execute: light_night_mode
 
   - platform: fan_rf
     name: "Remote: all off"
@@ -366,17 +516,167 @@ binary_sensor:
     key: timer_4h
     repeats: false
 
-# Commands originated here rather than relayed. `key` takes any name from
-# PROTOCOL.md section 4, or a raw 0-31 value, and can be templated.
+# Commands originated here rather than relayed: one entity per key of the fan
+# half, and one per light action the remote has a key for. `key` takes any name
+# from PROTOCOL.md section 4, or a raw 0-31 value, and can be templated.
+#
+# These are the buttons, not the fan: the entity above is the thing to automate
+# against, and these are the individual keys under it. Each fan button
+# transmits unconditionally and then tells the entity what it sent, which makes
+# it the way to resync a fan that has drifted -- the entity sends nothing when
+# asked for the state it already claims, and after an ESP32-only restart it
+# claims off while the fan runs.
+#
+# The light buttons run the same local actions the remote's light keys do.
+# Nothing of theirs reaches the MCU; `relay: fan` drops the light half.
 button:
   - platform: template
     name: "Fan: off"
     on_press:
+      # `fan off`, not `all off` -- `all off` would take the light with it.
       - fan_rf.send_key:
           fan_rf_id: fan_remote
           key: fan_off
+      - script.execute:
+          id: fan_show_speed
+          speed: 0
 
   - platform: template
     name: "Fan: speed 1"
     on_press:
-      - fan_rf.send_key: fan_1
+      - fan_rf.send_key:
+          fan_rf_id: fan_remote
+          key: fan_1
+      - script.execute:
+          id: fan_show_speed
+          speed: 1
+
+  - platform: template
+    name: "Fan: speed 2"
+    on_press:
+      - fan_rf.send_key:
+          fan_rf_id: fan_remote
+          key: fan_2
+      - script.execute:
+          id: fan_show_speed
+          speed: 2
+
+  - platform: template
+    name: "Fan: speed 3"
+    on_press:
+      - fan_rf.send_key:
+          fan_rf_id: fan_remote
+          key: fan_3
+      - script.execute:
+          id: fan_show_speed
+          speed: 3
+
+  - platform: template
+    name: "Fan: speed 4"
+    on_press:
+      - fan_rf.send_key:
+          fan_rf_id: fan_remote
+          key: fan_4
+      - script.execute:
+          id: fan_show_speed
+          speed: 4
+
+  - platform: template
+    name: "Fan: speed 5"
+    on_press:
+      - fan_rf.send_key:
+          fan_rf_id: fan_remote
+          key: fan_5
+      - script.execute:
+          id: fan_show_speed
+          speed: 5
+
+  - platform: template
+    name: "Fan: speed 6"
+    on_press:
+      - fan_rf.send_key:
+          fan_rf_id: fan_remote
+          key: fan_6
+      - script.execute:
+          id: fan_show_speed
+          speed: 6
+
+  - platform: template
+    name: "Fan: forward"
+    on_press:
+      - fan_rf.send_key:
+          fan_rf_id: fan_remote
+          key: fan_forward
+      - script.execute:
+          id: fan_show_direction
+          reverse: false
+
+  - platform: template
+    name: "Fan: reverse"
+    on_press:
+      - fan_rf.send_key:
+          fan_rf_id: fan_remote
+          key: fan_reverse
+      - script.execute:
+          id: fan_show_direction
+          reverse: true
+
+  # The one key that crosses the two halves, and the only button here that has
+  # to do both jobs itself: the injected frame stops the fan at the MCU, but the
+  # light is the ESP32's now and the MCU can no longer switch it off. Same split
+  # the remote's own `all off` gets below.
+  - platform: template
+    name: "All off"
+    on_press:
+      - fan_rf.send_key:
+          fan_rf_id: fan_remote
+          key: all_off
+      - script.execute:
+          id: fan_show_speed
+          speed: 0
+      - light.turn_off: led_light
+
+  # One tap of a brightness key. A held remote key repeats the step every
+  # 41.1 ms; a button is one step, and the light entity's own slider is there
+  # for anything that wants to jump straight to a level.
+  - platform: template
+    name: "Light: brightness up"
+    on_press:
+      - script.execute:
+          id: brightness_step
+          delta: ${dim_step}
+
+  - platform: template
+    name: "Light: brightness down"
+    on_press:
+      - script.execute:
+          id: brightness_step
+          delta: -${dim_step}
+
+  # Named for where the light ends up, not for a sign. "colour temperature up"
+  # is the phrase that got the remote keys below backwards: it reads as more
+  # Kelvin to one person and a warmer light to the next, and those are opposite
+  # directions. Warmer is more mireds, hence the positive delta.
+  - platform: template
+    name: "Light: warmer"
+    on_press:
+      - script.execute:
+          id: colour_temp_step
+          delta: ${ct_step}
+
+  - platform: template
+    name: "Light: cooler"
+    on_press:
+      - script.execute:
+          id: colour_temp_step
+          delta: -${ct_step}
+
+  - platform: template
+    name: "Light: full brightness"
+    on_press:
+      - script.execute: light_full_bright
+
+  - platform: template
+    name: "Light: night mode"
+    on_press:
+      - script.execute: light_night_mode

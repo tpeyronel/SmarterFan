@@ -217,6 +217,50 @@ inline const char *key_name(uint8_t key) {
   }
 }
 
+// --- speed <-> key ----------------------------------------------------------
+//
+// The six OEM speeds are six separate buttons, so anything holding a speed --
+// the Home Assistant fan entity, an automation -- has to name the key that
+// selects it. Read off the table above like everything else here, never
+// computed: the codes are not contiguous and do not run in speed order.
+
+static const uint8_t FAN_SPEED_COUNT = 6;
+
+// Speed 1..FAN_SPEED_COUNT, or 0 for off. Anything else is off too, so a
+// caller that clamps badly stops the fan rather than picking a speed at random.
+// Off is `fan off`, not `all off` -- `all off` kills the light as well.
+inline uint8_t key_for_speed(uint8_t speed) {
+  switch (speed) {
+    case 1: return KEY_FAN_1;
+    case 2: return KEY_FAN_2;
+    case 3: return KEY_FAN_3;
+    case 4: return KEY_FAN_4;
+    case 5: return KEY_FAN_5;
+    case 6: return KEY_FAN_6;
+    default: return KEY_FAN_OFF;
+  }
+}
+
+// The inverse, for mirroring a press of the physical remote into whatever holds
+// the speed. -1 for a key that does not select one -- the light keys, the
+// direction keys, and every code this remote has no button for.
+//
+// `all off` reports 0: it stops the fan as well as the light, so a fan that
+// tracked only `fan off` would sit there claiming to run.
+inline int speed_for_key(uint8_t key) {
+  switch (key) {
+    case KEY_FAN_1: return 1;
+    case KEY_FAN_2: return 2;
+    case KEY_FAN_3: return 3;
+    case KEY_FAN_4: return 4;
+    case KEY_FAN_5: return 5;
+    case KEY_FAN_6: return 6;
+    case KEY_FAN_OFF:
+    case KEY_ALL_OFF: return 0;
+    default: return -1;
+  }
+}
+
 struct Packet {
   uint32_t raw;      // the 32 bits as received, MSB first
   uint32_t prefix;   // bits 31..12

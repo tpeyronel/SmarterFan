@@ -296,6 +296,22 @@ Three properties shape everything else:
 
 **Home Assistant** is the richer option and essentially free from ESPHome: a `light` with brightness and colour temperature, a `fan` with the six OEM speeds, and HA automations for the sunrise alarm. Note the CCT slider is one-dimensional and normalised, so it cannot express every pair of channel levels — "warm at 100%, cool at 40%" is not a point on it. `light.control` with explicit `cold_white:`/`warm_white:` still reaches those. One entity is the right number; a second for the raw channels would be two lights fighting over the same hardware.
 
+### The entities
+
+| Entity | What it is |
+|---|---|
+| `light` **Light** | The two optocouplers as one CWWW light. Brightness and colour temperature, driven by the ESP32 — nothing here reaches the MCU |
+| `fan` **Fan** | On/off, the six OEM speeds and direction, as `fan off` / `fan 1`–`fan 6` / `fan forward` / `fan reverse` injected into the MCU |
+| `button` **Fan: …** | The nine fan keys individually — off, speeds 1–6, forward, reverse |
+| `button` **Light: …** | The six light keys — brightness ±, warmer/cooler, full brightness, night mode |
+| `binary_sensor` **Remote: …** | Momentary, one per light key: what the handheld remote is doing |
+| `binary_sensor` **Custom: …** | `natural wind`, `2H`, `4H` — the three [claimed keys](#press-hold-and-relay), actionless and waiting for an automation |
+| Diagnostic | Uptime, reset reason, Wi-Fi signal |
+
+**The fan entity is optimistic, and cannot be anything else.** The MCU reports nothing and the injection path is one-way into it, so the entity holds the last command anyone is known to have sent, not a reading. Two things keep that close to the truth: presses of the handheld remote are decoded here anyway, so they are mirrored into the entity as they go past, and each **Fan:** button transmits its key unconditionally — the entity itself sends nothing when asked for the state it already claims. Nothing is restored across a restart and nothing is transmitted at boot, so after an ESP32-only restart (an OTA, a watchdog) the entity reads off while the fan runs; any **Fan:** button, or one press of the remote, puts the two back together.
+
+Speed and direction are separate keys, so a single call that changes both transmits two frames back to back — the second waits out the first, about 41 ms.
+
 **Matter** would let Apple/Google/Alexa drive the fan without HA, but **ESPHome has no Matter component** (checked against 2026.8.0, which ships `openthread` and nothing that speaks Matter), so it is a different firmware stack rather than a config change — and Matter still needs a commercial hub as controller. The C3 is Wi-Fi only in any case; Thread would need a C6 or H2.
 
 ---
