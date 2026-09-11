@@ -220,7 +220,7 @@ inject:   .   .   .   .   . F                tapped — starts at the deadline
 
 ### Dimming
 
-The `MT9722S` **gates rather than averages** its dim input — measured, since the PWM becomes visible as flicker below ~250 Hz. That is the good case: average light tracks duty, and what stops it is a minimum pulse *width*, not a minimum duty. So the lowest usable duty is `t_min × frequency`, which makes **frequency the dimming-depth knob and lower dimmer** — the opposite of the usual instinct. Dropping the carrier from the OEM's 1 kHz to 250 Hz makes the same pulse a quarter of the duty. `t_min` is [measured per optocoupler](#confirmed-on-hardware) — 3.2 µs on the warm channel, 3.9 µs on the cold — which is what puts `min_power` at 0.079% and 0.1% here.
+The `MT9722S` **gates rather than averages** its dim input — measured, since the PWM becomes visible as flicker below ~250 Hz. That is the good case: average light tracks duty, and what stops it is a minimum pulse *width*, not a minimum duty. So the lowest usable duty is `t_min × frequency`, which makes **frequency the dimming-depth knob and lower dimmer** — the opposite of the usual instinct. Dropping the carrier from the OEM's 1 kHz to 250 Hz makes the same pulse a quarter of the duty. `t_min` is [measured per optocoupler](#confirmed-on-hardware) — 3.4 µs on the warm channel, 3.9 µs on the cold — which is what puts `min_power` at 0.085% and 0.1% here.
 
 What bounds the frequency from below: **visible flicker**, measured at ~250 Hz; **beating against the 100 Hz mains ripple** already on the LED current (CE5/CE6 are 2.2 µF feeding ~28 W a channel — nowhere near enough hold-up), so sit between harmonics rather than on one; and **stroboscopic beating against the blades**, per fan speed, [not yet checked](#still-open). 250 Hz sits exactly on the measured flicker floor and clears the harmonics by 50 Hz either side, but has no margin. The next stop up is ~350 Hz, at the cost of 40% more minimum duty.
 
@@ -261,8 +261,8 @@ Three properties shape everything else:
 
 ### Confirmed on hardware
 
-- **The LED path works.** `R37`/`R38` out, 620 Ω from GPIO 7 and GPIO 10, 250 Hz, `min_power` 0.079% warm and 0.1% cold — and the light dims far below the OEM minimum, which was the point of the project. A 3.2 µs pulse against the OEM's dimmest 74 µs at four times the repetition rate: **0.079% duty against 7.4%, a 93× lower floor** on the warm channel, 75× on the cold.
-- **`t_min` is 3.2 µs on one PC817 and 3.9 µs on the other, and the PC817 imposes it, not the `MT9722S`.** Swept each channel down at 250 Hz, one LEDC count (0.244 µs at the C3's 14 bits) at a time, from a temporary knob in Home Assistant: `R37` (warm) still lights at 13 counts — 3.17 µs, 0.079% — and goes dark rather than dimmer at 12; `R38` (cold) still lights at 16 counts — 3.9 µs, 0.1% — and is dark at 15. Two optocouplers from the same reel, a quarter-microsecond apart. `min_power_r37` is **0.079%** and `min_power_r38` is **0.1%**, each on its own floor rather than above it. Nearly the whole range is in the last step: 1% down to 0.2% barely changes, then 0.2% → 0.1% does almost all the dimming — the signature of a switching-time limit rather than a duty one. Being a pulse width, it scales with the carrier, so what is left of the dimming range lives in `pwm_frequency`, and [flicker](#dimming) is what caps that.
+- **The LED path works.** `R37`/`R38` out, 620 Ω from GPIO 7 and GPIO 10, 250 Hz, `min_power` 0.085% warm and 0.1% cold — and the light dims far below the OEM minimum, which was the point of the project. A 3.4 µs pulse against the OEM's dimmest 74 µs at four times the repetition rate: **0.085% duty against 7.4%, an 87× lower floor** on the warm channel, 75× on the cold.
+- **`t_min` is 3.4 µs on one PC817 and 3.9 µs on the other, and the PC817 imposes it, not the `MT9722S`.** Swept each channel down at 250 Hz, one LEDC count (0.244 µs at the C3's 14 bits) at a time, from a temporary knob in Home Assistant: `R37` (warm) is steady at 14 counts — 3.42 µs, 0.085% — flickers at 13 (3.17 µs) and goes dark rather than dimmer at 12; `R38` (cold) is steady at 16 counts — 3.9 µs, 0.1% — and is dark at 15. Two optocouplers from the same reel, half a microsecond apart. The flicker at 13 is the edge itself: a pulse the opto passes on some cycles and not others. `min_power_r37` is **0.085%** and `min_power_r38` is **0.1%**, each on its own floor rather than above it. Nearly the whole range is in the last step: 1% down to 0.2% barely changes, then 0.2% → 0.1% does almost all the dimming — the signature of a switching-time limit rather than a duty one. Being a pulse width, it scales with the carrier, so what is left of the dimming range lives in `pwm_frequency`, and [flicker](#dimming) is what caps that.
 - **The RF relay works in both directions.** The remote's light keys reach the decoder and drive the light; its fan keys are reconstructed and injected into the OEM MCU, which accepts them.
 - Optocouplers are non-inverting from the ESP32's side (`led_inverted: "false"`); **`R38`/GPIO 10 is cold, `R37`/GPIO 7 is warm**.
 - **An occasional flicker at any brightness was the ESP32 rebooting itself**, not the analogue path — `api:` and `wifi:` both default to `reboot_timeout: 15min`. See [Two defaults that reboot the fan](#two-defaults-that-reboot-the-fan).
@@ -353,14 +353,14 @@ minute so it can be judged without waiting for dawn.
 
 The defaults, then, put a 30-minute fade here — `duty` being what the
 optocoupler actually sees, after the light's gamma and the warm channel's
-0.079% `min_power` floor:
+0.085% `min_power` floor:
 
 | min | brightness state | duty | colour |
 |---:|---:|---:|---:|
-| 0 | 0.010 | **0.08%** — the measured floor | 2700 K |
+| 0 | 0.010 | **0.09%** — the measured floor | 2700 K |
 | 5 | 0.175 | 0.84% | 2837 K |
-| 10 | 0.340 | 4.95% | 2988 K |
-| 15 | 0.505 | 14.83% | 3157 K |
+| 10 | 0.340 | 4.96% | 2988 K |
+| 15 | 0.505 | 14.84% | 3157 K |
 | 20 | 0.670 | 32.64% | 3346 K |
 | 25 | 0.835 | 60.39% | 3558 K |
 | 30 | 1.000 | 100% | 3800 K |

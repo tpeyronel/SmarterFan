@@ -18,12 +18,12 @@ substitutions:
 
   # Duty floor per channel, on but at its dimmest. MEASURED, and this is the
   # floor rather than a preference. The C3's LEDC is 14 bits, so at 250 Hz one
-  # count is 0.244 us: R37 (warm) still lights at 13 counts, 3.17 us, and is
-  # dark at 12; R38 (cold) still lights at 16 counts, 3.9 us, and is dark at
-  # 15. Two optocouplers, two floors. That is the PC817's switching time, not
+  # count is 0.244 us: R37 (warm) is steady at 14 counts, 3.42 us, flickers at
+  # 13 and is dark at 12; R38 (cold) is steady at 16 counts, 3.9 us, and dark
+  # at 15. Two optocouplers, two floors. That is the PC817's switching time, not
   # a duty limit, so it moves with pwm_frequency -- halve the carrier and the
   # same pulse is half the duty. See README > Dimming.
-  min_power_r37: "0.079%"
+  min_power_r37: "0.085%"
   min_power_r38: "0.1%"
 
   # Lower carrier = dimmer minimum (the MT9722S gates, it does not average).
