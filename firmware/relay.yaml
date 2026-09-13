@@ -514,6 +514,8 @@ datetime:
 switch:
   # The master enable. Off and the arming check returns immediately, so a
   # restored alarm time sits there inert rather than needing to be cleared.
+  # A fade already running is stopped too: the interval only consults this
+  # switch when arming, so without the hook a fade would run on to the alarm.
   - platform: template
     id: sunrise_enabled
     name: "Sunrise alarm"
@@ -521,6 +523,8 @@ switch:
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
     entity_category: config
+    on_turn_off:
+      - script.execute: sunrise_cancel
 
 number:
   # How far before the alarm the light starts.
@@ -676,6 +680,15 @@ script:
     then:
       - lambda: |-
           id(fan_sent_reverse) = reverse ? 1 : 0;
+          // A direction-only change goes through on_state like any other, and
+          // on_state compares the speed too. While the speed shadow is still
+          // -1 -- nothing sent since boot -- that comparison would find "off"
+          // unsent and inject `fan off` on the heels of the direction key. The
+          // MCU restores its own state across a reboot, so the fan IS running
+          // then, and that `fan off` would stop it. Pin the shadow to what the
+          // entity already claims: direction changes nothing about speed.
+          if (id(fan_sent_speed) < 0)
+            id(fan_sent_speed) = id(fan_motor).state ? id(fan_motor).speed : 0;
           auto call = id(fan_motor).make_call();
           call.set_direction(reverse ? fan::FanDirection::REVERSE : fan::FanDirection::FORWARD);
           call.perform();
@@ -826,6 +839,13 @@ script:
                 id(sunrise_active) = false;
                 id(sunrise_progress).publish_state(0.0f);
                 ESP_LOGI("sunrise", "cancelled");
+            # When the cancel comes from the light's on_state, the light call
+            # that raised it is still inside perform() and saves its new state
+            # only after on_state returns. Yield one loop before flushing so
+            # that save is pending when sync() runs -- otherwise a reboot inside
+            # flash_write_interval brings the light back at the fade's last
+            # level, on, even when the cancel was somebody switching it off.
+            - delay: 1ms
             - script.execute: sunrise_mark
 
   # Write the resume marker -- the alarm being faded to, or 0 when no fade is
@@ -835,7 +855,8 @@ script:
   #
   # `sunrise_resume_alarm` is the component the global lives in; `id()` reads
   # its value, and update() is its once-a-second check, called early. sync()
-  # commits everything pending, the light's last save included.
+  # commits everything pending -- the light's last save included, provided the
+  # light call that made it has already returned (see sunrise_cancel).
   - id: sunrise_mark
     then:
       - lambda: |-
@@ -1100,9 +1121,11 @@ button:
     on_press:
       - script.execute: light_night_mode
 
-  # The whole curve compressed into ${sunrise_test_seconds}, from wherever the
-  # light is now and ignoring the alarm entirely. The real thing takes half an
-  # hour and happens before dawn, which is not a thing to debug in place.
+  # The whole curve compressed into ${sunrise_test_seconds}, ignoring the alarm
+  # entirely. It starts where a real one does -- the first step drops the light
+  # to the floor at the warmest mireds over one tick -- not from wherever the
+  # light is now. The real thing takes half an hour and happens before dawn,
+  # which is not a thing to debug in place.
   #
   # It does not touch `sunrise_handled`, so testing does not consume the
   # morning's alarm.
