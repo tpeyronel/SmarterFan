@@ -61,6 +61,13 @@ substitutions:
   # `Sunrise: test` runs the entire curve in this many seconds.
   sunrise_test_seconds: "60"
 
+  # Two cuts at the wall inside this window turn an off light on: the second
+  # cut has to land within this long of the first power-up. Tight, so that
+  # only a deliberate double flip qualifies -- but the first boot eats about a
+  # second of it before the flag is even armed, so there is not much room
+  # below this. See globals > power_cut_armed.
+  double_cut_window: "3s"
+
 esphome:
   name: smarterfan-relay
   friendly_name: SmarterFan Relay
@@ -68,11 +75,14 @@ esphome:
   # `Sunrise progress` is publish-only -- the fade pushes it and nothing polls
   # it -- so without this it reads "unknown" until the first sunrise ever runs.
   on_boot:
+    # After the light and the restoring globals, which both set up at HARDWARE
+    # priority: the wall-switch check below reads one and writes the other.
     priority: -100
     then:
       - sensor.template.publish:
           id: sunrise_progress
           state: 0.0
+      - script.execute: power_cut_check
 
 esp32:
   board: esp32-c3-devkitm-1
@@ -347,6 +357,28 @@ globals:
     restore_value: false
     initial_value: '0.0f'
 
+  # --- wall switch ---
+  # Flip the wall switch off and on twice, quickly, and an off light comes on
+  # at whatever it was last on at. A cut at the wall takes the ESP32 down with
+  # the fan, so this is a boot-time decision, and the ESP32 has no clock that
+  # survives a power loss -- it cannot time the cut itself. What it can know
+  # is how far the previous run had got when it ended, and that is what this
+  # holds: true in flash from a power-up until ${double_cut_window} later,
+  # false from then on. A boot that finds it true came within the window of
+  # the last one; two cuts in a row, not a single flip, and not a blackout.
+  #
+  # Written to flash on the spot at both ends (see power_cut_check), not on the
+  # 60 s flash_write_interval, which is longer than the window it measures.
+  #
+  # The one false positive: switch on, switch off again within the window,
+  # and the next switch-on -- hours later -- finds the flag still set and
+  # turns the light on. Acceptable: that IS somebody at the wall switch, and
+  # only a second flip ever reaches here.
+  - id: power_cut_armed
+    type: bool
+    restore_value: true
+    initial_value: 'false'
+
 fan:
   - platform: template
     id: fan_motor
@@ -441,7 +473,8 @@ light:
     default_transition_length: 0s
 
     # Brightness, mix and on/off survive a restart -- including turning the
-    # light back on when a blackout ends.
+    # light back on when a blackout ends. An off light stays off, unless the
+    # cut was the second in quick succession: see power_cut_check.
     restore_mode: RESTORE_DEFAULT_OFF
 
     # Touching the light during a sunrise ends the sunrise. There is no list of
@@ -692,6 +725,45 @@ script:
           auto call = id(fan_motor).make_call();
           call.set_direction(reverse ? fan::FanDirection::REVERSE : fan::FanDirection::FORWARD);
           call.perform();
+
+  # --- wall switch ---
+  # Runs once, from on_boot. Only a power-up counts, at either end: an OTA, a
+  # panic or a watchdog is ESP_RST_SW / PANIC / WDT, and neither arms the flag
+  # for the run it starts nor acts on one left by the run before, so a reboot
+  # straight after a flip cannot turn the light on, and a flip straight after
+  # a reboot cannot either. A wall switch that dropped the rail short of a
+  # full power-off comes back as BROWNOUT, which is the same event.
+  #
+  # The turn-on has no arguments on purpose: the light keeps brightness and
+  # mix while off, and that is the "last on value". Only an off light is
+  # touched -- one that was on when the power went is restored on already.
+  - id: power_cut_check
+    then:
+      - lambda: |-
+          const auto reason = esp_reset_reason();
+          const bool power_up = reason == ESP_RST_POWERON || reason == ESP_RST_BROWNOUT;
+          const bool previous_run_was_short = id(power_cut_armed);
+
+          // Arm for this run, or clear what a non-power-up boot would
+          // otherwise leave lying around for the next flip to find.
+          id(power_cut_armed) = power_up;
+          power_cut_armed->update();
+          global_preferences->sync();
+
+          if (power_up && previous_run_was_short &&
+              !id(led_light).remote_values.is_on()) {
+            ESP_LOGI("wall_switch", "second cut inside the window: light on");
+            id(led_light).turn_on().perform();
+          }
+      - if:
+          condition:
+            lambda: 'return id(power_cut_armed);'
+          then:
+            - delay: ${double_cut_window}
+            - lambda: |-
+                id(power_cut_armed) = false;
+                power_cut_armed->update();
+                global_preferences->sync();
 
   # --- sunrise alarm ---
   # Is now inside a sunrise window, and if so, claim it. Runs on every tick

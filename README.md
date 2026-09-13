@@ -317,6 +317,8 @@ Three properties shape everything else:
 
 Speed and direction are separate keys, so a single call that changes both transmits two frames back to back — the second waits out the first, about 41 ms.
 
+**The wall switch is a light switch too, if flipped twice.** Off-on, off-on within 3 s and an off light comes on at whatever it was last on at; a single flip, a blackout or an OTA restart leave it as it was. The ESP32 has no clock that survives a power loss, so it cannot time a cut — what it can know is how long the previous run lasted. Every power-up sets a flag in flash and clears it 3 s later, and a power-up that finds the flag still set is the second of two. The window is `double_cut_window` in `relay.yaml`.
+
 ### Sunrise alarm
 
 The light ramps from its dimmest and warmest up to full across the half hour
