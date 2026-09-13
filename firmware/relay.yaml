@@ -314,6 +314,25 @@ globals:
     restore_value: false
     initial_value: '0'
 
+  # The alarm whose fade was running when the device last saved state, or 0.
+  # This is the one piece of sunrise state that IS restored, because the
+  # light's own state is: every step goes through light.control, which saves,
+  # so a reboot mid-fade brings the light back on at wherever the fade had got
+  # to. Without this the arming check would read that as "somebody is sitting
+  # in a lit room", skip, and write off the alarm -- the light stuck at 40%
+  # for the rest of the morning instead of resuming.
+  #
+  # An epoch rather than a flag so it can only ever vouch for the alarm that
+  # set it: a marker left behind by an old fade matches nothing and is inert.
+  # Set when a real sunrise arms, cleared when one ends by any route, and in
+  # both cases flushed to NVS on the spot (see sunrise_mark) rather than on
+  # the 60 s flash_write_interval, so a reboot right after a cancel does not
+  # come back and resume a fade somebody had just taken over.
+  - id: sunrise_resume_alarm
+    type: int64_t
+    restore_value: true
+    initial_value: '0'
+
   # What the last step commanded -- the same shadow trick the fan entity uses
   # above. The light's on_state fires for every change including the fade's
   # own, and what separates a person from the fade is whether the value that
@@ -700,7 +719,12 @@ script:
           // An alarm has no business dimming a room somebody is sitting in.
           // At or below the floor counts as off: that is where the fade would
           // start anyway, and where `night mode` leaves the light.
-          if (id(led_light).remote_values.is_on() &&
+          //
+          // Unless the light is on because the fade itself put it there: a
+          // reboot mid-fade restores the light at the fade's last saved level,
+          // and a marker naming this very alarm is what says so.
+          const bool resuming = id(sunrise_resume_alarm) == alarm;
+          if (!resuming && id(led_light).remote_values.is_on() &&
               id(led_light).remote_values.get_brightness() > ${dim_floor} + 0.001f) {
             ESP_LOGI("sunrise", "in window, but the light is already on -- skipping");
             return;
@@ -712,11 +736,13 @@ script:
           id(sunrise_span_ms) = (uint32_t) (span * 1000);
           id(sunrise_t0_ms) = millis() - (uint32_t) ((t - start) * 1000);
           id(sunrise_active) = true;
-          ESP_LOGI("sunrise", "starting, %d s of fade to the alarm", (int) (alarm - t));
+          ESP_LOGI("sunrise", "%s, %d s of fade to the alarm", resuming ? "resuming" : "starting",
+                   (int) (alarm - t));
       - if:
           condition:
             lambda: 'return id(sunrise_active);'
           then:
+            - script.execute: sunrise_mark
             # Straight into the first step rather than waiting a tick, so a
             # resumed fade jumps to its true position immediately.
             - script.execute: sunrise_step
@@ -763,6 +789,13 @@ script:
             id(sunrise_active) = false;
             ESP_LOGI("sunrise", "complete");
           }
+      # Only on the last step: sunrise_mark flushes NVS, and doing that every
+      # tick would be a flash write per 5 s for the whole fade.
+      - if:
+          condition:
+            lambda: 'return !id(sunrise_active);'
+          then:
+            - script.execute: sunrise_mark
       - light.control:
           id: led_light
           state: true
@@ -779,12 +812,33 @@ script:
   # tick will not start it over.
   - id: sunrise_cancel
     then:
+      # Guarded as a condition rather than a return inside the lambda, so an
+      # idle press of the cancel button does not fall through to sunrise_mark
+      # and force a flash flush for nothing.
+      - if:
+          condition:
+            lambda: 'return id(sunrise_active);'
+          then:
+            - lambda: |-
+                id(sunrise_active) = false;
+                id(sunrise_progress).publish_state(0.0f);
+                ESP_LOGI("sunrise", "cancelled");
+            - script.execute: sunrise_mark
+
+  # Write the resume marker -- the alarm being faded to, or 0 when no fade is
+  # running -- and push it to flash now. The restoring global is polled once a
+  # second and flushed on flash_write_interval, and the gap is exactly where a
+  # reboot would either lose a fresh marker or resurrect a cancelled one.
+  #
+  # `sunrise_resume_alarm` is the component the global lives in; `id()` reads
+  # its value, and update() is its once-a-second check, called early. sync()
+  # commits everything pending, the light's last save included.
+  - id: sunrise_mark
+    then:
       - lambda: |-
-          if (!id(sunrise_active))
-            return;
-          id(sunrise_active) = false;
-          id(sunrise_progress).publish_state(0.0f);
-          ESP_LOGI("sunrise", "cancelled");
+          id(sunrise_resume_alarm) = id(sunrise_active) ? id(sunrise_handled) : 0;
+          sunrise_resume_alarm->update();
+          global_preferences->sync();
 
 # The light keys, acted on here since `relay: fan` drops them. `repeats` stays
 # on where a hold should ramp, off where it should register once.
