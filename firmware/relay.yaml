@@ -747,9 +747,12 @@ script:
             # resumed fade jumps to its true position immediately.
             - script.execute: sunrise_step
 
-  # One step of the fade, and the whole of it: nothing is precomputed, so the
-  # duration and both endpoints can be changed while a sunrise is running and
-  # the next step picks them up.
+  # One step of the fade, and the whole of it. The two endpoints are read
+  # fresh each step, so end brightness and end colour can be changed while a
+  # sunrise is running and the next step picks them up. The duration is not:
+  # it fixes the start time, and the start time is what the fade is clocked
+  # from, so it is captured when the fade arms and a change takes effect on
+  # the next alarm.
   - id: sunrise_step
     mode: single
     then:
