@@ -509,6 +509,36 @@ light:
             id(sunrise_cancel).execute();
           }
 
+      # A channel Home Assistant sends as rounding noise is a channel that is
+      # off. For this light HA sends the mix as explicit cold/warm fractions,
+      # computed against the range it was told about -- and aioesphomeapi
+      # tidies that range to 7 significant digits on the way in, so the warm
+      # end reaches HA as 370.3704 mireds instead of 370.37036. 2700 K is then
+      # not quite the end, nothing clamps it, and cold arrives as 1.37e-7
+      # rather than 0. Measured on the device, and not a fraction of anything
+      # visible: zero_means_zero spares only an exact zero, so the cold LEDs
+      # come on at min_power. The remote never gets here -- the firmware
+      # derives its own mix from mireds, and lands on exact zeros.
+      #
+      # So a channel under 1e-4 of the stronger one is zeroed by a second
+      # call, from inside the first one's on_state since the light has no
+      # hook ahead of a call. Far below anything intended: one Kelvin off the
+      # warm end is 6e-4. The second call carries no transition, so one that
+      # HA asked for completes at once when this fires -- the favourites and
+      # the slider send none.
+      - lambda: |-
+          const auto &v = id(led_light).remote_values;
+          const float cw = v.get_cold_white();
+          const float ww = v.get_warm_white();
+          const bool cw_noise = cw > 0.0f && cw < 1e-4f;
+          const bool ww_noise = ww > 0.0f && ww < 1e-4f;
+          if (!cw_noise && !ww_noise)
+            return;
+          auto call = id(led_light).make_call();
+          call.set_cold_white(cw_noise ? 0.0f : cw);
+          call.set_warm_white(ww_noise ? 0.0f : ww);
+          call.perform();
+
 # --- sunrise alarm ---------------------------------------------------------
 # The fade runs here rather than in Home Assistant, and HA's only job is to
 # keep `Alarm time` pointing at the phone's next alarm. Everything after that
