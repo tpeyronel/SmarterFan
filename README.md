@@ -78,7 +78,7 @@ MCU high 4.48 V, post-resistor 1.12 V (PC817 Vf)  →  3.36 mA
 From a 3.3 V GPIO: (3.3 − 1.12) / 0.00336 ≈ 650 Ω  →  620 Ω
 ```
 
-Both pads carry `ledc` PWM at **250 Hz** (not the OEM's 1 kHz — see [Dimming](#dimming)), and the two channels are one `cwww` light: brightness on one axis, channel mix on the other. The mix is normalised by the larger fraction, so mid-colour-temperature is *both* channels at full rather than each at half, and 100% there is the full 56 W. Total output therefore roughly doubles toward the middle of the CCT sweep. That is deliberate — it is what reaching full output costs.
+Both pads carry `ledc` PWM at **250 Hz** (not the OEM's 1 kHz — see [Dimming](#dimming)), and the two channels are one `cwww` light: brightness on one axis, channel mix on the other. The mix is normalised by the larger fraction, so mid-colour-temperature is *both* channels at full rather than each at half, and 100% there is both channels at the **`Max brightness`** ceiling — 90% duty by default, to go easy on the LEDs, and settable from Home Assistant up to the full 56 W. Total output therefore roughly doubles toward the middle of the CCT sweep. That is deliberate — it is what reaching full output costs.
 
 **2. RF — relayed through the ESP32.** The `102` between the receiver's output and the MCU's input comes out and the ESP32 sits in the middle: it taps the receiver through a level shifter and decodes the OOK in software, then reconstructs packets and injects them into the MCU's input, which cannot tell the difference. Fan commands are forwarded; the six light keys stop at the ESP32 and drive the LEDs directly.
 
@@ -309,6 +309,7 @@ Three properties shape everything else:
 | `binary_sensor` **Custom: …** | `natural wind`, `2H`, `4H` — the three [claimed keys](#press-hold-and-relay), actionless and waiting for an automation |
 | `datetime` **Alarm time** | What the [sunrise](#sunrise-alarm) runs up to. Written by Home Assistant from the phone's next alarm, and settable by hand from the web page |
 | `switch` **Sunrise alarm** | Master enable. Off and nothing arms, whatever **Alarm time** says |
+| `number` **Max brightness** | The duty ceiling on both channels, and so what the light's 100% means. 90% by default |
 | `number` **Sunrise …** | Duration, end brightness, end colour temperature |
 | `button` **Sunrise: …** | Test — the whole curve in a minute — and cancel |
 | Diagnostic | Uptime, reset reason, Wi-Fi signal, sunrise progress |
@@ -354,18 +355,18 @@ minute so it can be judged without waiting for dawn.
 | **The clock** | `sntp` **and** `homeassistant`, both configured. Either alone is enough — both set the system clock — and neither is a given here, with Home Assistant off-site behind a VPN and no promise of a route to the internet on the LAN. |
 
 The defaults, then, put a 30-minute fade here — `duty` being what the
-optocoupler actually sees, after the light's gamma and the warm channel's
-0.085% `min_power` floor:
+optocoupler actually sees, after the light's gamma, the warm channel's
+0.085% `min_power` floor and the default 90% `Max brightness` ceiling:
 
 | min | brightness state | duty | colour |
 |---:|---:|---:|---:|
 | 0 | 0.010 | **0.09%** — the measured floor | 2700 K |
-| 5 | 0.175 | 0.84% | 2837 K |
-| 10 | 0.340 | 4.96% | 2988 K |
-| 15 | 0.505 | 14.84% | 3157 K |
-| 20 | 0.670 | 32.64% | 3346 K |
-| 25 | 0.835 | 60.39% | 3558 K |
-| 30 | 1.000 | 100% | 3800 K |
+| 5 | 0.175 | 0.77% | 2837 K |
+| 10 | 0.340 | 4.47% | 2988 K |
+| 15 | 0.505 | 13.36% | 3157 K |
+| 20 | 0.670 | 29.38% | 3346 K |
+| 25 | 0.835 | 54.35% | 3558 K |
+| 30 | 1.000 | 90% | 3800 K |
 
 Barely there for the first ten minutes, most of the work in the last third.
 That is the gamma doing it, not a curve in the config.

@@ -46,6 +46,12 @@ substitutions:
   # sweep stays ~2 s whatever the Kelvin endpoints below become.
   ct_step: "0.02"
 
+  # First-boot value of the `Max brightness` number, in percent: the ceiling
+  # on each channel's duty, so the light's 100% is this much of what the
+  # driver can do. Below full to go easy on the LEDs. Only a default -- the
+  # number is restored, and after the first boot Home Assistant owns it.
+  max_brightness: "90"
+
   # IANA name, set explicitly rather than left to ESPHome's autodetect -- which
   # reads the clock of whatever machine ran the compile. The sunrise alarm is a
   # wall-clock comparison, so a wrong zone is a fade an hour out, not an error.
@@ -429,6 +435,10 @@ fan:
 #
 # Frequency and min_power are one setting in two halves -- what the opto sees
 # is a pulse width, min_power / frequency -- so neither moves alone.
+#
+# No max_power here: the ceiling is the `Max brightness` number, set at run
+# time. The light's range is mapped onto min_power..max_power, so it scales
+# every level, not just the top one.
 output:
   - platform: ledc
     id: led_r37
@@ -560,6 +570,33 @@ switch:
       - script.execute: sunrise_cancel
 
 number:
+  # The duty ceiling on both channels, and so what the light's 100% means. A
+  # number rather than a substitution so it can be moved from Home Assistant
+  # without a reflash.
+  - platform: template
+    id: light_max_brightness
+    name: "Max brightness"
+    icon: mdi:brightness-percent
+    unit_of_measurement: "%"
+    min_value: 10
+    max_value: 100
+    step: 1
+    initial_value: ${max_brightness}
+    restore_value: true
+    optimistic: true
+    mode: slider
+    entity_category: config
+    on_value:
+      - lambda: |-
+          id(led_r37).set_max_power(x / 100.0f);
+          id(led_r38).set_max_power(x / 100.0f);
+          // The new ceiling reaches the pins on the next write, and a light
+          // that is not transitioning does not write. Push one now -- except
+          // for the restore at boot, which can run before the LEDC channels
+          // are set up and comes before the light's own first write anyway.
+          if (id(led_r37).is_ready() && id(led_r38).is_ready())
+            id(led_light).get_output()->write_state(id(led_light));
+
   # How far before the alarm the light starts.
   - platform: template
     id: sunrise_duration
@@ -575,8 +612,8 @@ number:
     mode: box
     entity_category: config
 
-  # Where the fade ends. 100% at the default colour temperature below is the
-  # full 56 W.
+  # Where the fade ends. 100% at the default colour temperature below is both
+  # channels at the `Max brightness` ceiling.
   - platform: template
     id: sunrise_end_brightness
     name: "Sunrise end brightness"
