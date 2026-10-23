@@ -347,7 +347,7 @@ minute so it can be judged without waiting for dawn.
 | | |
 |---|---|
 | **Curve** | Linear in the light's brightness *state*, with deliberately nothing on top. The light's `gamma_correct` of 2.8 already bends output as p<sup>2.8</sup> — close enough to the cube law between luminance and perceived lightness that the ramp *looks* linear. A second curve would leave the first twenty minutes doing nothing visible. |
-| **Colour** | Warmest → the end colour temperature, so the room reddens before it brightens. The 3800 K default is the **middle of the mireds range, where both channels reach full** and total output peaks. 6500 K is the cold channel alone: bluer, and about half the light. |
+| **Colour** | Warm channel alone for the first half, then warmest → the end colour temperature, so the room reddens before it whitens. The hold is because at the warmest the cold channel is at exactly zero, but one step off it and the cold channel comes on at its own `min_power` floor — a second floor on top of the warm one, doubling how strong the first minute starts. By half way the warm channel is far enough up that the cold one's floor disappears in it. `sunrise_white_from` moves the point. The 3800 K default is the **middle of the mireds range, where both channels reach full** and total output peaks. 6500 K is the cold channel alone: bluer, and about half the light. |
 | **Steps** | One every 5 s, each with a 5 s transition, so the light interpolates continuously between them rather than stepping. That is ~360 state updates across a half hour where 1 Hz would be 1800, at identical smoothness. |
 | **Ending one** | Any brightness or colour change during a fade cancels it — the remote, a button, a Home Assistant slider, the web page. There is no list of sources to maintain: they all arrive at the light's `on_state`, and what separates them from the fade's own steps is a shadow variable, the same trick the [fan entity](#the-entities) uses. |
 | **Not starting one** | A sunrise will not start if the light is already on above its floor. An alarm has no business dimming a room somebody is sitting in. |
@@ -361,11 +361,11 @@ optocoupler actually sees, after the light's gamma, the warm channel's
 | min | brightness state | duty | colour |
 |---:|---:|---:|---:|
 | 0 | 0.010 | **0.09%** — the measured floor | 2700 K |
-| 5 | 0.175 | 0.77% | 2837 K |
-| 10 | 0.340 | 4.47% | 2988 K |
-| 15 | 0.505 | 13.36% | 3157 K |
-| 20 | 0.670 | 29.38% | 3346 K |
-| 25 | 0.835 | 54.35% | 3558 K |
+| 5 | 0.175 | 0.77% | 2700 K |
+| 10 | 0.340 | 4.47% | 2700 K |
+| 15 | 0.505 | 13.36% | 2700 K |
+| 20 | 0.670 | 29.38% | 2988 K |
+| 25 | 0.835 | 54.35% | 3346 K |
 | 30 | 1.000 | 90% | 3800 K |
 
 Barely there for the first ten minutes, most of the work in the last third.

@@ -64,6 +64,15 @@ substitutions:
   # updates: 5 s is ~360 across a half-hour fade where 1 s would be 1800.
   sunrise_tick: "5s"
 
+  # How far into the sunrise, as a fraction, the colour holds at the warmest
+  # before it starts toward the end colour temperature. At the warmest the mix
+  # puts the cold channel at exactly zero; one step off it and the cold channel
+  # comes on at its own min_power, a floor of its own on top of the warm one,
+  # so the very first minute would start at twice the intended dimness. Half
+  # way is where the warm channel is already far enough above its floor that
+  # the cold one arriving at its floor is lost in it.
+  sunrise_white_from: "0.5"
+
   # `Sunrise: test` runs the entire curve in this many seconds.
   sunrise_test_seconds: "60"
 
@@ -661,7 +670,7 @@ number:
     entity_category: config
 
   # Where the colour ends. The fade always starts at the warmest the light can
-  # do and runs to here.
+  # do, holds there until ${sunrise_white_from} of the way in, and runs to here.
   #
   # 3800 K is the default because it is the middle of the mireds range, and the
   # middle is where BOTH channels reach full: the cwww mix normalises by the
@@ -928,8 +937,13 @@ script:
           // twenty minutes doing nothing visible.
           id(sunrise_shadow_brightness) =
               ${dim_floor} + p * (id(sunrise_end_brightness).state / 100.0f - ${dim_floor});
-          // Warmest to target, so the room reddens before it brightens.
-          id(sunrise_shadow_mireds) = warmest + p * (target - warmest);
+          // Warmest alone until ${sunrise_white_from}, then warmest to target
+          // over the rest, so the room reddens before it whitens. Held at the
+          // warmest EXACTLY, not near it: that is what keeps the cold channel
+          // at zero rather than at its min_power floor.
+          const float from = ${sunrise_white_from};
+          const float q = clamp((p - from) / (1.0f - from), 0.0f, 1.0f);
+          id(sunrise_shadow_mireds) = warmest + q * (target - warmest);
 
           // Zero means idle, whether the fade finished or was cancelled, so
           // the sensor answers "is a sunrise running, and how far in" and can
